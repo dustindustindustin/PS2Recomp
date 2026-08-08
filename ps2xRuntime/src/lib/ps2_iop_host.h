@@ -75,6 +75,7 @@ public:
     void closeHostFile(uint64_t handle) override;
 
     int32_t memoryCard(const ps2x::iop::MemoryCardRequest &request) override;
+    bool readPadInput(uint32_t port, uint32_t slot, ps2x::iop::PadInputSnapshot &state) override;
 
     bool hasGuestFunction(uint32_t address) const override;
     bool invokeGuestFunction(uint64_t callToken,

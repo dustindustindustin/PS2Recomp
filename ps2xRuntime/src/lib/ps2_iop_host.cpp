@@ -4,6 +4,7 @@
 #include "ps2_stubs.h"
 #include "runtime/ps2_memory.h"
 #include "Kernel/Stubs/CD.h"
+#include "Kernel/Stubs/Pad.h"
 #include "Kernel/Stubs/MemoryCard.h"
 #include "Kernel/Syscalls/Common.h"
 
@@ -461,6 +462,23 @@ int32_t PS2IopHostAdapter::memoryCard(const ps2x::iop::MemoryCardRequest &reques
             &context,
             &m_runtime);
     return ps2_stubs::getMemoryCardDebugSnapshot().lastResult;
+}
+
+bool PS2IopHostAdapter::readPadInput(uint32_t port, uint32_t slot,
+                                     ps2x::iop::PadInputSnapshot &state)
+{
+    ps2_stubs::PadInputSnapshot snapshot{};
+    if (!ps2_stubs::readPadInputSnapshot(&m_runtime, static_cast<int>(port),
+                                         static_cast<int>(slot), snapshot))
+    {
+        return false;
+    }
+    state.buttons = snapshot.buttons;
+    state.rx = snapshot.rx;
+    state.ry = snapshot.ry;
+    state.lx = snapshot.lx;
+    state.ly = snapshot.ly;
+    return true;
 }
 
 bool PS2IopHostAdapter::hasGuestFunction(uint32_t address) const

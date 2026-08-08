@@ -20,6 +20,10 @@ namespace ps2x::iop::detail
         [[nodiscard]] virtual std::span<const uint32_t> sids() const = 0;
         virtual void reset() = 0;
 
+        virtual void update()
+        {
+        }
+
         [[nodiscard]] virtual RpcAbi selectRpcAbi(const RpcAbiRequest &request) const
         {
             (void)request;

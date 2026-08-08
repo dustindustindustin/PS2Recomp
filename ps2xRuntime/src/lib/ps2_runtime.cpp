@@ -2733,6 +2733,7 @@ void PS2Runtime::run()
     uint64_t tick = 0;
     while (!isStopRequested() && g_activeThreads.load(std::memory_order_relaxed) > 0)
     {
+        m_iopSubsystem->update();
         PS2_IF_AGRESSIVE_LOGS({
             tick++;
             if ((tick % 120) == 0)

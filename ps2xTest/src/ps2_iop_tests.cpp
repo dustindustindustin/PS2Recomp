@@ -283,6 +283,15 @@ namespace
             return 0;
         }
 
+        bool readPadInput(uint32_t port, uint32_t slot, PadInputSnapshot &state) override
+        {
+            lastPadPort = port;
+            lastPadSlot = slot;
+            ++padReadCalls;
+            state = padInput;
+            return padInputAvailable;
+        }
+
         bool hasGuestFunction(uint32_t address) const override
         {
             return address == guestFunctionAddress;
@@ -344,6 +353,11 @@ namespace
         GuestBuffer lastAudioReceive{};
         uint32_t memoryCardCalls = 0u;
         MemoryCardRequest lastMemoryCardRequest{};
+        bool padInputAvailable = false;
+        PadInputSnapshot padInput{};
+        uint32_t padReadCalls = 0u;
+        uint32_t lastPadPort = 0u;
+        uint32_t lastPadSlot = 0u;
         uint32_t guestFunctionAddress = 0x2000u;
         uint32_t guestFunctionResult = 0x3000u;
         uint64_t lastCallToken = 0u;
@@ -550,6 +564,25 @@ void register_ps2_iop_tests()
                      "OPEN should initialize the first XPAD half stable");
             t.Equals(static_cast<uint32_t>(host.memory[kPadArea + 0x80u + 112u]), 6u,
                      "OPEN should initialize the second XPAD half stable");
+
+            host.padInputAvailable = true;
+            host.padInput.buttons = 0xFFF7u;
+            subsystem.update();
+            t.Equals(host.padReadCalls, 1u,
+                     "PADMAN update should sample an open controller");
+            t.Equals(host.lastPadPort, 0u,
+                     "PADMAN should sample the opened port");
+            t.Equals(static_cast<uint32_t>(host.memory[kPadArea + 2u]), 0xF7u,
+                     "PADMAN should publish an active-low Start press");
+            t.Equals(host.readWord(kPadArea + 88u), 2u,
+                     "PADMAN should advance the first XPAD half frame");
+
+            host.padInput.buttons = 0xFFFFu;
+            subsystem.update();
+            t.Equals(static_cast<uint32_t>(host.memory[kPadArea + 0x80u + 2u]), 0xFFu,
+                     "PADMAN should publish button release in the alternate half");
+            t.Equals(host.readWord(kPadArea + 0x80u + 88u), 3u,
+                     "PADMAN should advance the alternate XPAD half frame");
 
             RpcRequest invalidOpen = open;
             t.IsTrue(host.writeWord(kSend + 0x10u, kPadArea + 1u),

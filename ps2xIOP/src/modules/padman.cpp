@@ -31,6 +31,8 @@ namespace ps2x::iop::detail
         {
             bool open = false;
             uint32_t padArea = 0u;
+            uint32_t nextFrame = 2u;
+            uint32_t nextHalf = 0u;
         };
 
         std::array<uint8_t, kXpadAreaSize> makeNeutralXpadArea()
@@ -91,6 +93,42 @@ namespace ps2x::iop::detail
                 m_lastCommand = 0u;
                 m_sessions = {};
                 m_openCount = 0u;
+            }
+
+            void update() override
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                for (uint32_t port = 0u; port < m_sessions.size(); ++port)
+                {
+                    PadmanSession &session = m_sessions[port];
+                    if (!session.open)
+                    {
+                        continue;
+                    }
+
+                    PadInputSnapshot input{};
+                    if (!m_host.readPadInput(port, 0u, input))
+                    {
+                        continue;
+                    }
+
+                    auto area = makeNeutralXpadArea();
+                    uint8_t *const half = area.data() + session.nextHalf * kXpadHalfSize;
+                    half[2] = static_cast<uint8_t>(input.buttons & 0xFFu);
+                    half[3] = static_cast<uint8_t>((input.buttons >> 8u) & 0xFFu);
+                    half[4] = input.rx;
+                    half[5] = input.ry;
+                    half[6] = input.lx;
+                    half[7] = input.ly;
+                    std::memcpy(half + 88u, &session.nextFrame, sizeof(session.nextFrame));
+
+                    const uint32_t address = session.padArea + session.nextHalf * kXpadHalfSize;
+                    if (m_host.writeGuest(address, half, kXpadHalfSize))
+                    {
+                        ++session.nextFrame;
+                        session.nextHalf ^= 1u;
+                    }
+                }
             }
 
             [[nodiscard]] RpcResult handleRpc(const RpcRequest &request) override
@@ -159,7 +197,7 @@ namespace ps2x::iop::detail
 
                     {
                         std::lock_guard<std::mutex> lock(m_mutex);
-                        m_sessions[port] = {true, padArea};
+                        m_sessions[port] = {true, padArea, 2u, 0u};
                         ++m_openCount;
                     }
 

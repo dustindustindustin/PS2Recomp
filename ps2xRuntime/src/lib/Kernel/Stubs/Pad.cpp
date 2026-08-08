@@ -229,6 +229,50 @@ namespace ps2_stubs
             portState.transientState = static_cast<uint32_t>(kPadStateExecCmd);
         }
 
+        PadInputState samplePadInput(PS2Runtime *runtime, int port, int slot,
+                                     bool allowAnalog, bool *usedOverride = nullptr,
+                                     bool *usedBackend = nullptr)
+        {
+            PadInputState state;
+            bool overrideActive = false;
+            {
+                std::lock_guard<std::mutex> lock(g_padOverrideMutex);
+                if (g_padOverrideEnabled)
+                {
+                    state = g_padOverrideState;
+                    overrideActive = true;
+                }
+            }
+
+            bool backendActive = false;
+            uint8_t backendData[32]{};
+            if (!overrideActive && runtime &&
+                runtime->padBackend().readState(port, slot, backendData, sizeof(backendData)))
+            {
+                state.buttons = static_cast<uint16_t>(backendData[2] | (backendData[3] << 8));
+                state.rx = backendData[4];
+                state.ry = backendData[5];
+                state.lx = backendData[6];
+                state.ly = backendData[7];
+                backendActive = true;
+            }
+            else if (!overrideActive)
+            {
+                applyGamepadState(state);
+                applyKeyboardState(state, allowAnalog);
+            }
+
+            if (usedOverride)
+            {
+                *usedOverride = overrideActive;
+            }
+            if (usedBackend)
+            {
+                *usedBackend = backendActive;
+            }
+            return state;
+        }
+
         uint8_t pressureValue(const PadInputState &state, const PadPortState &portState, uint16_t mask)
         {
             if (!portState.pressureEnabled)
@@ -284,36 +328,10 @@ namespace ps2_stubs
                 portState = *sharedPortState;
             }
 
-            PadInputState state;
             bool useOverride = false;
-            {
-                std::lock_guard<std::mutex> lock(g_padOverrideMutex);
-                if (g_padOverrideEnabled)
-                {
-                    state = g_padOverrideState;
-                    useOverride = true;
-                }
-            }
-
             bool usedBackend = false;
-            if (!useOverride)
-            {
-                uint8_t backendData[32]{};
-                if (runtime && runtime->padBackend().readState(port, slot, backendData, sizeof(backendData)))
-                {
-                    state.buttons = static_cast<uint16_t>(backendData[2] | (backendData[3] << 8));
-                    state.rx = backendData[4];
-                    state.ry = backendData[5];
-                    state.lx = backendData[6];
-                    state.ly = backendData[7];
-                    usedBackend = true;
-                }
-                else
-                {
-                    applyGamepadState(state);
-                    applyKeyboardState(state, portState.analogMode);
-                }
-            }
+            const PadInputState state = samplePadInput(runtime, port, slot, portState.analogMode,
+                                                       &useOverride, &usedBackend);
 
             fillPadStatus(outData, state, portState);
 
@@ -333,6 +351,23 @@ namespace ps2_stubs
 
             return true;
         }
+    }
+
+    bool readPadInputSnapshot(PS2Runtime *runtime, int port, int slot, PadInputSnapshot &snapshot)
+    {
+        if (port < 0 || port >= static_cast<int>(kPadPortCount) ||
+            slot < 0 || slot >= static_cast<int>(kPadSlotCount))
+        {
+            return false;
+        }
+
+        const PadInputState state = samplePadInput(runtime, port, slot, true);
+        snapshot.buttons = state.buttons;
+        snapshot.rx = state.rx;
+        snapshot.ry = state.ry;
+        snapshot.lx = state.lx;
+        snapshot.ly = state.ly;
+        return true;
     }
 
     void PadSyncCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

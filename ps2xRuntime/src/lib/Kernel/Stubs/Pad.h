@@ -42,6 +42,15 @@ namespace ps2_stubs
     static constexpr size_t kPadDebugSlotCount = 1u;
     static constexpr size_t kPadDebugDataSize = 32u;
 
+    struct PadInputSnapshot
+    {
+        uint16_t buttons = 0xFFFFu;
+        uint8_t rx = 0x80u;
+        uint8_t ry = 0x80u;
+        uint8_t lx = 0x80u;
+        uint8_t ly = 0x80u;
+    };
+
     struct PadDebugPortSnapshot
     {
         bool open = false;
@@ -75,6 +84,7 @@ namespace ps2_stubs
         PadDebugPortSnapshot ports[kPadDebugPortCount][kPadDebugSlotCount]{};
     };
 
+    bool readPadInputSnapshot(PS2Runtime *runtime, int port, int slot, PadInputSnapshot &snapshot);
     PadDebugSnapshot getPadDebugSnapshot();
     void setPadOverrideState(uint16_t buttons, uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry);
     void clearPadOverrideState();

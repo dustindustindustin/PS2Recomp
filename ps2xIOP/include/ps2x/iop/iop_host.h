@@ -61,6 +61,15 @@ namespace ps2x::iop
         std::string name;
     };
 
+    struct PadInputSnapshot
+    {
+        uint16_t buttons = 0xFFFFu;
+        uint8_t rx = 0x80u;
+        uint8_t ry = 0x80u;
+        uint8_t lx = 0x80u;
+        uint8_t ly = 0x80u;
+    };
+
     class IopHost
     {
     public:
@@ -94,6 +103,14 @@ namespace ps2x::iop
         virtual void closeHostFile(uint64_t handle) = 0;
 
         virtual int32_t memoryCard(const MemoryCardRequest &request) = 0;
+
+        virtual bool readPadInput(uint32_t port, uint32_t slot, PadInputSnapshot &state)
+        {
+            (void)port;
+            (void)slot;
+            state = {};
+            return false;
+        }
 
         virtual bool hasGuestFunction(uint32_t address) const = 0;
         virtual bool invokeGuestFunction(uint64_t callToken,

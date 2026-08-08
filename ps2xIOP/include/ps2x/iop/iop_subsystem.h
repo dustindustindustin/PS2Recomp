@@ -26,6 +26,7 @@ namespace ps2x::iop
 
         bool configure(const GameIdentity &identity, std::string *error = nullptr);
         void reset();
+        void update();
 
         [[nodiscard]] RpcAbi selectRpcAbi(const RpcAbiRequest &request) const;
         [[nodiscard]] bool handlesSid(uint32_t sid) const;

@@ -250,6 +250,24 @@ namespace ps2x::iop
         }
     }
 
+    void IopSubsystem::update()
+    {
+        for (auto &service : m_impl->coreServices)
+        {
+            if (service)
+            {
+                service->update();
+            }
+        }
+        for (auto &service : m_impl->profileServices)
+        {
+            if (service)
+            {
+                service->update();
+            }
+        }
+    }
+
     RpcAbi IopSubsystem::selectRpcAbi(const RpcAbiRequest &request) const
     {
         for (const auto &service : m_impl->profileServices)
