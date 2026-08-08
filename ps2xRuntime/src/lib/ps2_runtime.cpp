@@ -2754,14 +2754,48 @@ void PS2Runtime::run()
     uint64_t tick = 0;
     uint64_t hostFrame = 0;
     const bool automatedStart = std::getenv("PS2X_AUTOMATED_PAD_START") != nullptr;
+    const bool automatedNewGame = std::getenv("PS2X_AUTOMATED_NEW_GAME") != nullptr;
+    uint64_t automatedNewGameFrame = 3600u;
+    if (const char *configuredFrame = std::getenv("PS2X_AUTOMATED_NEW_GAME_FRAME");
+        configuredFrame != nullptr && *configuredFrame != '\0')
+    {
+        char *end = nullptr;
+        const unsigned long long parsed = std::strtoull(configuredFrame, &end, 0);
+        if (end != configuredFrame && *end == '\0' && parsed >= 120u)
+            automatedNewGameFrame = static_cast<uint64_t>(parsed);
+    }
+    bool reportedAutomatedStart = false;
+    bool reportedAutomatedCross = false;
     while (!isStopRequested() && g_activeThreads.load(std::memory_order_relaxed) > 0)
     {
         ++hostFrame;
-        if (automatedStart)
+        if (automatedStart || automatedNewGame)
         {
-            const bool pressStart = hostFrame >= 120u && (hostFrame % 60u) < 6u;
-            if (pressStart)
+            const bool pressCross =
+                automatedNewGame && hostFrame >= automatedNewGameFrame &&
+                ((hostFrame - automatedNewGameFrame) % 120u) < 6u;
+            const bool pressStart =
+                !pressCross && hostFrame >= 120u &&
+                (!automatedNewGame || hostFrame < automatedNewGameFrame) &&
+                (hostFrame % 60u) < 6u;
+            if (pressCross)
+            {
+                ps2_stubs::setPadOverrideState(0xBFFFu, 0x80u, 0x80u, 0x80u, 0x80u);
+                if (!reportedAutomatedCross)
+                {
+                    std::cout << "[automated-input] Cross pressed at host frame " << hostFrame << std::endl;
+                    reportedAutomatedCross = true;
+                }
+            }
+            else if (pressStart)
+            {
                 ps2_stubs::setPadOverrideState(0xFFF7u, 0x80u, 0x80u, 0x80u, 0x80u);
+                if (!reportedAutomatedStart)
+                {
+                    std::cout << "[automated-input] Start pressed at host frame " << hostFrame << std::endl;
+                    reportedAutomatedStart = true;
+                }
+            }
             else
                 ps2_stubs::clearPadOverrideState();
         }
@@ -2854,7 +2888,7 @@ void PS2Runtime::run()
         }
     }
 
-    if (automatedStart)
+    if (automatedStart || automatedNewGame)
         ps2_stubs::clearPadOverrideState();
 
     requestStop();

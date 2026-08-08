@@ -1622,7 +1622,7 @@ void register_ps2_gs_tests()
                      "single-circuit presentation should normalize the last row alpha");
         });
 
-        tc.Run("latched host presentation line-doubles interlaced field output", [](TestCase &t)
+        tc.Run("latched host presentation line-doubles a stable interlaced field", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GSRegisters regs{};

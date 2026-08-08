@@ -223,10 +223,15 @@ namespace
             return;
         }
 
+        // Present one stable field on progressive host displays. Alternating
+        // the source parity every VSync produces a visible one-line vertical
+        // bob in static interlaced content such as title and menu screens.
+        // The guest still observes normal field parity through GS timing.
+        (void)oddField;
         const std::vector<uint8_t> source = pixels;
         for (uint32_t y = 0; y < height; ++y)
         {
-            uint32_t sourceY = ((y >> 1u) << 1u) + (oddField ? 1u : 0u);
+            uint32_t sourceY = (y >> 1u) << 1u;
             if (sourceY >= height)
             {
                 sourceY = height - 1u;
