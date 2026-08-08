@@ -135,7 +135,9 @@ namespace ps2_stubs
             setButton(state, kPadBtnR3, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_THUMB));
 
             setButton(state, kPadBtnSelect, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_MIDDLE_LEFT));
-            setButton(state, kPadBtnStart, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT));
+            setButton(state, kPadBtnStart,
+                      IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT) ||
+                          IsGamepadButtonPressed(gamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT));
         }
 
         void applyKeyboardState(PadInputState &state, bool allowAnalog)
@@ -164,7 +166,7 @@ namespace ps2_stubs
             setButton(state, kPadBtnL2, IsKeyDown(KEY_ONE));
             setButton(state, kPadBtnR2, IsKeyDown(KEY_THREE));
 
-            setButton(state, kPadBtnStart, IsKeyDown(KEY_ENTER));
+            setButton(state, kPadBtnStart, IsKeyDown(KEY_ENTER) || IsKeyPressed(KEY_ENTER));
             setButton(state, kPadBtnSelect, IsKeyDown(KEY_RIGHT_SHIFT));
             setButton(state, kPadBtnL3, IsKeyDown(KEY_LEFT_CONTROL));
             setButton(state, kPadBtnR3, IsKeyDown(KEY_RIGHT_CONTROL));
