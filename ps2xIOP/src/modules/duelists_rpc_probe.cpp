@@ -36,10 +36,15 @@ namespace ps2x::iop::detail
                 m_registrationCount = 0u;
                 m_rangeRegistrationCount = 0u;
                 m_function5000Calls = 0u;
+                m_function1020Calls = 0u;
+                m_function1021Calls = 0u;
                 m_function5002Calls = 0u;
                 m_function5003Calls = 0u;
                 m_function5004Calls = 0u;
                 m_function5005Calls = 0u;
+                m_function5102Calls = 0u;
+                m_function5201Calls = 0u;
+                m_function5220Calls = 0u;
                 m_function5202Calls = 0u;
                 m_f003Calls = 0u;
                 m_f006Calls = 0u;
@@ -359,6 +364,163 @@ namespace ps2x::iop::detail
                     }
                 }
 
+                const bool structurallyValid1020 =
+                    request.function == k1020Function &&
+                    request.mode == kNowaitMode &&
+                    validTypedEnvelope &&
+                    wordsReadable &&
+                    readableWords >= 4u &&
+                    words[0] != 0u &&
+                    words[1] != 0u &&
+                    words[2] != 0u &&
+                    (words[0] & (kSelfTokenAlignment - 1u)) == 0u;
+                if (structurallyValid1020)
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    if (m_selfToken != 0u &&
+                        words[0] == m_selfToken &&
+                        m_host.zeroGuest(request.receive.address, request.receive.size))
+                    {
+                        // KCEJEAST 1020 stages an audio data block. Preserve
+                        // its asynchronous completion contract while audio
+                        // synthesis remains idle.
+                        ++m_handledCalls;
+                        ++m_function1020Calls;
+                        recordRequest(request, words, wordsReadable);
+
+                        RpcResult result;
+                        result.handled = true;
+                        result.resultAddress = request.receive.address;
+                        result.signalNowaitCompletion = true;
+                        return result;
+                    }
+                }
+
+                const bool structurallyValid1021 =
+                    request.function == k1021Function &&
+                    request.mode == kNowaitMode &&
+                    validTypedEnvelope &&
+                    wordsReadable &&
+                    readableWords >= 4u &&
+                    words[0] != 0u &&
+                    words[1] != 0u &&
+                    words[3] != 0u &&
+                    (words[0] & (kSelfTokenAlignment - 1u)) == 0u;
+                if (structurallyValid1021)
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    if (m_selfToken != 0u &&
+                        words[0] == m_selfToken &&
+                        m_host.zeroGuest(request.receive.address, request.receive.size))
+                    {
+                        // KCEJEAST 1021 finalizes the staged audio block at
+                        // its requested sound-memory destination.
+                        ++m_handledCalls;
+                        ++m_function1021Calls;
+                        recordRequest(request, words, wordsReadable);
+
+                        RpcResult result;
+                        result.handled = true;
+                        result.resultAddress = request.receive.address;
+                        result.signalNowaitCompletion = true;
+                        return result;
+                    }
+                }
+
+                const bool structurallyValid5201 =
+                    request.function == k5201Function &&
+                    request.mode == kNowaitMode &&
+                    validTypedEnvelope &&
+                    wordsReadable &&
+                    readableWords >= 1u &&
+                    words[0] != 0u &&
+                    (words[0] & (kSelfTokenAlignment - 1u)) == 0u;
+                if (structurallyValid5201)
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    if (m_selfToken != 0u &&
+                        words[0] == m_selfToken &&
+                        m_host.zeroGuest(request.receive.address, request.receive.size))
+                    {
+                        // KCEJEAST's 5201 command stops one program instance.
+                        // The title bootstrap only requires completion; the
+                        // service's zeroed status is the idle result.
+                        ++m_handledCalls;
+                        ++m_function5201Calls;
+                        recordRequest(request, words, wordsReadable);
+
+                        RpcResult result;
+                        result.handled = true;
+                        result.resultAddress = request.receive.address;
+                        result.signalNowaitCompletion = true;
+                        return result;
+                    }
+                }
+
+                const bool structurallyValid5220 =
+                    request.function == k5220Function &&
+                    request.mode == kNowaitMode &&
+                    validTypedEnvelope &&
+                    wordsReadable &&
+                    readableWords >= 2u &&
+                    words[0] != 0u &&
+                    words[1] != 0u &&
+                    (words[0] & (kSelfTokenAlignment - 1u)) == 0u;
+                if (structurallyValid5220)
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    if (m_selfToken != 0u &&
+                        words[0] == m_selfToken &&
+                        m_host.zeroGuest(request.receive.address, request.receive.size))
+                    {
+                        // KCEJEAST's 5220 command starts or queues a program
+                        // instance. Audio synthesis is not active yet, so
+                        // acknowledge the validated request as an idle service.
+                        ++m_handledCalls;
+                        ++m_function5220Calls;
+                        recordRequest(request, words, wordsReadable);
+
+                        RpcResult result;
+                        result.handled = true;
+                        result.resultAddress = request.receive.address;
+                        result.signalNowaitCompletion = true;
+                        return result;
+                    }
+                }
+
+                const bool structurallyValid5102 =
+                    request.function == k5102Function &&
+                    request.mode == kNowaitMode &&
+                    validTypedEnvelope &&
+                    wordsReadable &&
+                    readableWords >= 4u &&
+                    words[0] != 0u &&
+                    words[2] != 0u &&
+                    words[3] != 0u &&
+                    (words[0] & (kSelfTokenAlignment - 1u)) == 0u;
+                if (structurallyValid5102)
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    if (m_selfToken != 0u &&
+                        words[0] == m_selfToken &&
+                        m_host.zeroGuest(request.receive.address, request.receive.size))
+                    {
+                        // KCEJEAST 5102 accepts a program-data guest address
+                        // and byte size. Audio synthesis is not active yet,
+                        // but acknowledging the validated upload lets the
+                        // title bootstrap continue with an idle service.
+                        ++m_handledCalls;
+                        ++m_function5102Calls;
+                        recordRequest(request, words, wordsReadable);
+
+                        RpcResult result;
+                        result.handled = true;
+                        result.resultAddress = request.receive.address;
+                        result.signalNowaitCompletion = true;
+                        return result;
+                    }
+                }
+
                 const bool structurallyValid5004 =
                     request.function == k5004Function &&
                     request.mode == kNowaitMode &&
@@ -538,12 +700,17 @@ namespace ps2x::iop::detail
                 metrics.push_back({"registration_count", m_registrationCount, false});
                 metrics.push_back({"range_registration_count", m_rangeRegistrationCount, false});
                 metrics.push_back({"function_5000_calls", m_function5000Calls, false});
+                metrics.push_back({"function_1020_calls", m_function1020Calls, false});
+                metrics.push_back({"function_1021_calls", m_function1021Calls, false});
                 metrics.push_back({"function_5002_calls", m_function5002Calls, false});
                 metrics.push_back({"function_5003_calls", m_function5003Calls, false});
                 metrics.push_back({"last_5003_fade_step", m_last5003FadeStep, true});
                 metrics.push_back({"function_5004_calls", m_function5004Calls, false});
                 metrics.push_back({"last_5004_fade_step", m_last5004FadeStep, true});
                 metrics.push_back({"function_5005_calls", m_function5005Calls, false});
+                metrics.push_back({"function_5102_calls", m_function5102Calls, false});
+                metrics.push_back({"function_5201_calls", m_function5201Calls, false});
+                metrics.push_back({"function_5220_calls", m_function5220Calls, false});
                 metrics.push_back({"function_5202_calls", m_function5202Calls, false});
                 metrics.push_back({"last_5005_argument_0", m_last5005Argument0, true});
                 metrics.push_back({"last_5005_argument_1", m_last5005Argument1, true});
@@ -591,10 +758,15 @@ namespace ps2x::iop::detail
             static constexpr uint32_t k5F10Function = 0x5F10u;
             static constexpr uint32_t k5F12Function = 0x5F12u;
             static constexpr uint32_t k5000Function = 0x5000u;
+            static constexpr uint32_t k1020Function = 0x1020u;
+            static constexpr uint32_t k1021Function = 0x1021u;
             static constexpr uint32_t k5002Function = 0x5002u;
             static constexpr uint32_t k5003Function = 0x5003u;
             static constexpr uint32_t k5004Function = 0x5004u;
             static constexpr uint32_t k5005Function = 0x5005u;
+            static constexpr uint32_t k5102Function = 0x5102u;
+            static constexpr uint32_t k5201Function = 0x5201u;
+            static constexpr uint32_t k5220Function = 0x5220u;
             static constexpr uint32_t k5202Function = 0x5202u;
             static constexpr uint32_t kF003Function = 0xF003u;
             static constexpr uint32_t kF004Function = 0xF004u;
@@ -613,10 +785,15 @@ namespace ps2x::iop::detail
             uint64_t m_registrationCount = 0u;
             uint64_t m_rangeRegistrationCount = 0u;
             uint64_t m_function5000Calls = 0u;
+            uint64_t m_function1020Calls = 0u;
+            uint64_t m_function1021Calls = 0u;
             uint64_t m_function5002Calls = 0u;
             uint64_t m_function5003Calls = 0u;
             uint64_t m_function5004Calls = 0u;
             uint64_t m_function5005Calls = 0u;
+            uint64_t m_function5102Calls = 0u;
+            uint64_t m_function5201Calls = 0u;
+            uint64_t m_function5220Calls = 0u;
             uint64_t m_function5202Calls = 0u;
             uint64_t m_f003Calls = 0u;
             uint64_t m_f006Calls = 0u;

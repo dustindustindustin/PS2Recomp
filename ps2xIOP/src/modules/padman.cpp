@@ -30,9 +30,11 @@ namespace ps2x::iop::detail
         struct PadmanSession
         {
             bool open = false;
+            bool loggedFirstUpdate = false;
             uint32_t padArea = 0u;
             uint32_t nextFrame = 2u;
             uint32_t nextHalf = 0u;
+            uint16_t lastButtons = 0xFFFFu;
         };
 
         std::array<uint8_t, kXpadAreaSize> makeNeutralXpadArea()
@@ -54,7 +56,7 @@ namespace ps2x::iop::detail
                 const uint32_t length = 8u;
                 std::memcpy(half + 88u, &frame, sizeof(frame));
                 std::memcpy(half + 96u, &length, sizeof(length));
-                half[101] = 4u; // digital controller mode ID
+                half[101] = kPadDigitalMode; // full current mode ID (0x41)
                 half[102] = 1u; // standard digital controller model
                 half[103] = 1u; // button data is ready
                 half[104] = 1u; // one available mode
@@ -110,6 +112,25 @@ namespace ps2x::iop::detail
                     if (!m_host.readPadInput(port, 0u, input))
                     {
                         continue;
+                    }
+
+                    if (!session.loggedFirstUpdate)
+                    {
+                        std::ostringstream message;
+                        message << "PADMAN first update port=" << port
+                                << " pad_area=0x" << std::hex << session.padArea
+                                << " buttons=0x" << input.buttons;
+                        m_host.log(LogLevel::Debug, message.str());
+                        session.loggedFirstUpdate = true;
+                    }
+
+                    if (input.buttons != session.lastButtons)
+                    {
+                        std::ostringstream message;
+                        message << "PADMAN input port=" << port
+                                << " buttons=0x" << std::hex << input.buttons;
+                        m_host.log(LogLevel::Debug, message.str());
+                        session.lastButtons = input.buttons;
                     }
 
                     auto area = makeNeutralXpadArea();
@@ -197,8 +218,16 @@ namespace ps2x::iop::detail
 
                     {
                         std::lock_guard<std::mutex> lock(m_mutex);
-                        m_sessions[port] = {true, padArea, 2u, 0u};
+                        m_sessions[port] = {true, false, padArea, 2u, 0u, 0xFFFFu};
                         ++m_openCount;
+                    }
+
+                    {
+                        std::ostringstream message;
+                        message << "PADMAN opened port=" << port
+                                << " slot=" << slot
+                                << " pad_area=0x" << std::hex << padArea;
+                        m_host.log(LogLevel::Debug, message.str());
                     }
 
                     RpcResult result;

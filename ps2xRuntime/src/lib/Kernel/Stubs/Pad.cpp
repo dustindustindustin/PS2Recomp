@@ -194,6 +194,38 @@ namespace ps2_stubs
             }
         }
 
+        void applyQueuedKeyboardPresses(PadInputState &state)
+        {
+            if (!IsWindowReady())
+            {
+                return;
+            }
+
+            for (int key = GetKeyPressed(); key != 0; key = GetKeyPressed())
+            {
+                switch (key)
+                {
+                case KEY_ENTER: setButton(state, kPadBtnStart, true); break;
+                case KEY_RIGHT_SHIFT: setButton(state, kPadBtnSelect, true); break;
+                case KEY_UP: setButton(state, kPadBtnUp, true); break;
+                case KEY_DOWN: setButton(state, kPadBtnDown, true); break;
+                case KEY_LEFT: setButton(state, kPadBtnLeft, true); break;
+                case KEY_RIGHT: setButton(state, kPadBtnRight, true); break;
+                case KEY_Z: setButton(state, kPadBtnSquare, true); break;
+                case KEY_X: setButton(state, kPadBtnCross, true); break;
+                case KEY_C: setButton(state, kPadBtnCircle, true); break;
+                case KEY_V: setButton(state, kPadBtnTriangle, true); break;
+                case KEY_Q: setButton(state, kPadBtnL1, true); break;
+                case KEY_E: setButton(state, kPadBtnR1, true); break;
+                case KEY_ONE: setButton(state, kPadBtnL2, true); break;
+                case KEY_THREE: setButton(state, kPadBtnR2, true); break;
+                case KEY_LEFT_CONTROL: setButton(state, kPadBtnL3, true); break;
+                case KEY_RIGHT_CONTROL: setButton(state, kPadBtnR3, true); break;
+                default: break;
+                }
+            }
+        }
+
         void resetPadStateLocked()
         {
             for (PadPortState &portState : g_padPorts)
@@ -262,6 +294,7 @@ namespace ps2_stubs
             {
                 applyGamepadState(state);
                 applyKeyboardState(state, allowAnalog);
+                applyQueuedKeyboardPresses(state);
             }
 
             if (usedOverride)

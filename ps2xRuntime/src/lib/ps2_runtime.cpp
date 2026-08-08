@@ -9,6 +9,7 @@
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
+#include "Kernel/Stubs/Pad.h"
 #include "Kernel/Stubs/SIF.h"
 #include "ps2_host_backend.h"
 #include "ps2_iop_host.h"
@@ -2731,8 +2732,19 @@ void PS2Runtime::run()
     ps2_syscalls::EnsureVSyncWorkerRunning(m_memory.getRDRAM(), this);
 
     uint64_t tick = 0;
+    uint64_t hostFrame = 0;
+    const bool automatedStart = std::getenv("PS2X_AUTOMATED_PAD_START") != nullptr;
     while (!isStopRequested() && g_activeThreads.load(std::memory_order_relaxed) > 0)
     {
+        ++hostFrame;
+        if (automatedStart)
+        {
+            const bool pressStart = hostFrame >= 120u && (hostFrame % 60u) < 6u;
+            if (pressStart)
+                ps2_stubs::setPadOverrideState(0xFFF7u, 0x80u, 0x80u, 0x80u, 0x80u);
+            else
+                ps2_stubs::clearPadOverrideState();
+        }
         m_iopSubsystem->update();
         PS2_IF_AGRESSIVE_LOGS({
             tick++;
@@ -2821,6 +2833,9 @@ void PS2Runtime::run()
             break;
         }
     }
+
+    if (automatedStart)
+        ps2_stubs::clearPadOverrideState();
 
     requestStop();
 

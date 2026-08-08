@@ -25,7 +25,7 @@ namespace
     constexpr uint16_t PAD_L2 = 0x0100u;
 }
 
-bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
+bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
 {
     if (!data || size < 32)
         return false;
@@ -38,6 +38,7 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
     data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
 
     uint16_t btns = 0xFFFFu;
+    uint16_t pressedEdges = 0u;
     constexpr int kGamepad = 0;
     const bool useGamepad = IsGamepadAvailable(kGamepad);
     auto clearBit = [&btns](uint16_t mask)
@@ -71,6 +72,8 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
             clearBit(PAD_R2);
         if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT))
             clearBit(PAD_START);
+        if (IsGamepadButtonPressed(kGamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT))
+            pressedEdges |= PAD_START;
         if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_LEFT))
             clearBit(PAD_SELECT);
         if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_THUMB))
@@ -89,6 +92,12 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
     }
     else
     {
+        auto keyDownOrPressed = [&pressedEdges](int key, uint16_t mask)
+        {
+            if (IsKeyPressed(key))
+                pressedEdges |= mask;
+            return IsKeyDown(key);
+        };
         if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
             clearBit(PAD_UP);
         if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S))
@@ -97,7 +106,7 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
             clearBit(PAD_LEFT);
         if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D))
             clearBit(PAD_RIGHT);
-        if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
+        if (keyDownOrPressed(KEY_X, PAD_CROSS) || keyDownOrPressed(KEY_SPACE, PAD_CROSS))
             clearBit(PAD_CROSS);
         if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
             clearBit(PAD_CIRCLE);
@@ -113,10 +122,25 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
             clearBit(PAD_L2);
         if (IsKeyDown(KEY_RIGHT_SHIFT))
             clearBit(PAD_R2);
-        if (IsKeyDown(KEY_ENTER))
+        if (keyDownOrPressed(KEY_ENTER, PAD_START))
             clearBit(PAD_START);
         if (IsKeyDown(KEY_TAB))
             clearBit(PAD_SELECT);
+    }
+
+    if (port >= 0 && port < static_cast<int>(m_latchedButtons.size()))
+    {
+        if (pressedEdges != 0u)
+        {
+            m_latchedButtons[port] |= pressedEdges;
+            m_latchSamples[port] = 2u;
+        }
+        if (m_latchSamples[port] != 0u)
+        {
+            btns &= static_cast<uint16_t>(~m_latchedButtons[port]);
+            if (--m_latchSamples[port] == 0u)
+                m_latchedButtons[port] = 0u;
+        }
     }
 
     data[2] = static_cast<uint8_t>(btns & 0xFF);
