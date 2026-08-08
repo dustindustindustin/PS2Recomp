@@ -514,6 +514,26 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         }
         ++s_uploadDebugCount;
     });
+
+    if (const char *frameDumpPath = std::getenv("PS2X_AUTOMATED_FRAME_DUMP");
+        frameDumpPath != nullptr && *frameDumpPath != '\0' &&
+        (currentTick % 60u) == 0u && width != 0u && height != 0u)
+    {
+        std::ofstream dump(frameDumpPath, std::ios::binary | std::ios::trunc);
+        if (dump)
+        {
+            dump << "P6\n" << width << ' ' << height << "\n255\n";
+            for (uint32_t y = 0u; y < height; ++y)
+            {
+                const size_t rowOffset = static_cast<size_t>(y) * width * 4u;
+                for (uint32_t x = 0u; x < width; ++x)
+                {
+                    const size_t pixelOffset = rowOffset + static_cast<size_t>(x) * 4u;
+                    dump.write(reinterpret_cast<const char *>(s_scratch.data() + pixelOffset), 3u);
+                }
+            }
+        }
+    }
     s_lastDisplayFbp = displayFbp;
     s_lastSourceFbp = sourceFbp;
     s_lastPreferred = usedPreferredDisplaySource;
