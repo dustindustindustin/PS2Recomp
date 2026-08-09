@@ -56,6 +56,8 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
             clearBit(PAD_RIGHT);
         if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN))
             clearBit(PAD_CROSS);
+        if (IsGamepadButtonPressed(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN))
+            pressedEdges |= PAD_CROSS;
         if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT))
             clearBit(PAD_CIRCLE);
         if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT))
