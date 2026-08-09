@@ -454,6 +454,17 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                                                    &sourceFbp,
                                                    &usedPreferredDisplaySource))
     {
+        // A display-register change can briefly point at a frame that the GS has
+        // not finished producing yet.  Keep presenting the last complete frame
+        // and force another latch attempt even if the guest VSync tick stalls.
+        s_hasLatchedInitialFrame = false;
+        if (s_hasUploadedFrame)
+        {
+            outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
+            outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
+            return;
+        }
+
         Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
         UpdateTexture(tex, blank.data);
         UnloadImage(blank);
@@ -461,7 +472,6 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         outHeight = DEFAULT_DISPLAY_HEIGHT;
         s_lastWidth = outWidth;
         s_lastHeight = outHeight;
-        s_hasUploadedFrame = true;
         return;
     }
 
