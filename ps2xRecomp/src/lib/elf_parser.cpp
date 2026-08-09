@@ -34,7 +34,9 @@ namespace
                name.rfind("DAT_", 0) == 0;
     }
 
-    void AppendLoadSegmentsAsSections(const ELFIO::elfio &elf, std::vector<ps2recomp::Section> &sections)
+    void AppendLoadSegmentsAsSections(const ELFIO::elfio &elf,
+                                      std::vector<ps2recomp::Section> &sections,
+                                      bool includeBss)
     {
         const ELFIO::Elf_Half segCount = elf.segments.size();
         if (segCount == 0)
@@ -74,10 +76,22 @@ namespace
                 load.data = const_cast<uint8_t *>(
                     reinterpret_cast<const uint8_t *>(segment->get_data()));
 
-                sections.push_back(load);
+                const uint64_t loadEnd = static_cast<uint64_t>(load.address) + load.size;
+                const bool alreadyCovered = std::any_of(
+                    sections.begin(), sections.end(), [&](const ps2recomp::Section &existing)
+                    {
+                        const uint64_t existingEnd =
+                            static_cast<uint64_t>(existing.address) + existing.size;
+                        return load.address >= existing.address && loadEnd <= existingEnd &&
+                               (!load.isCode || existing.isCode);
+                    });
+                if (!alreadyCovered)
+                {
+                    sections.push_back(load);
+                }
             }
 
-            if (memSize > fileSize)
+            if (includeBss && memSize > fileSize)
             {
                 ps2recomp::Section bss{};
                 bss.name = "LOAD" + std::to_string(i) + ".bss";
@@ -90,7 +104,18 @@ namespace
                 bss.isReadOnly = false;
                 bss.data = nullptr;
 
-                sections.push_back(bss);
+                const uint64_t bssEnd = static_cast<uint64_t>(bss.address) + bss.size;
+                const bool alreadyCovered = std::any_of(
+                    sections.begin(), sections.end(), [&](const ps2recomp::Section &existing)
+                    {
+                        const uint64_t existingEnd =
+                            static_cast<uint64_t>(existing.address) + existing.size;
+                        return bss.address >= existing.address && bssEnd <= existingEnd;
+                    });
+                if (!alreadyCovered)
+                {
+                    sections.push_back(bss);
+                }
             }
         }
 
@@ -1253,16 +1278,14 @@ namespace ps2recomp
             m_sections.push_back(section);
         }
 
-        if (m_sections.empty())
+        const bool hadNamedSections = !m_sections.empty();
+        AppendLoadSegmentsAsSections(*m_elf, m_sections, !hadNamedSections);
+        if (!hadNamedSections && !m_sections.empty())
         {
-            AppendLoadSegmentsAsSections(*m_elf, m_sections);
-            if (!m_sections.empty())
+            if (m_reporter)
             {
-                if (m_reporter)
-                {
-                    m_reporter->info("elf", "ELF has no section headers; using loadable segments as sections (" +
-                                          std::to_string(m_sections.size()) + " entries).");
-                }
+                m_reporter->info("elf", "ELF has no section headers; using loadable segments as sections (" +
+                                      std::to_string(m_sections.size()) + " entries).");
             }
         }
     }

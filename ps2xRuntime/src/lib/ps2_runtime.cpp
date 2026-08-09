@@ -1339,6 +1339,20 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
         readGuestU32Offset(a0Word0, 0x08u, vtableSlot8) &&
         readGuestU32Offset(a0Word0, 0x0cu, vtableSlotC);
 
+    uint32_t targetWord0 = 0u;
+    uint32_t targetWord4 = 0u;
+    uint32_t targetWord8 = 0u;
+    uint32_t targetWordC = 0u;
+    uint32_t targetWord40 = 0u;
+    uint32_t targetWord80 = 0u;
+    const bool targetReadable =
+        readGuestU32Offset(targetPc, 0x00u, targetWord0) &&
+        readGuestU32Offset(targetPc, 0x04u, targetWord4) &&
+        readGuestU32Offset(targetPc, 0x08u, targetWord8) &&
+        readGuestU32Offset(targetPc, 0x0cu, targetWordC) &&
+        readGuestU32Offset(targetPc, 0x40u, targetWord40) &&
+        readGuestU32Offset(targetPc, 0x80u, targetWord80);
+
     if (firstReport)
     {
         std::ostringstream oss;
@@ -1378,6 +1392,13 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
             << " vtbl[4]=0x" << vtableSlot4
             << " vtbl[8]=0x" << vtableSlot8
             << " vtbl[c]=0x" << vtableSlotC
+            << " targetReadable=" << (targetReadable ? "yes" : "no")
+            << " target[0]=0x" << targetWord0
+            << " target[4]=0x" << targetWord4
+            << " target[8]=0x" << targetWord8
+            << " target[c]=0x" << targetWordC
+            << " target[40]=0x" << targetWord40
+            << " target[80]=0x" << targetWord80
             << " codeRegion=" << (m_memory.isCodeAddress(targetPc) ? "yes" : "no")
             << " policy=" << static_cast<uint32_t>(policy)
             << " trace=" << formatDispatchHistory()

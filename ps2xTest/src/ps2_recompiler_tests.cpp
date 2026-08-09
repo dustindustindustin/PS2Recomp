@@ -155,6 +155,34 @@ static bool writeMinimalMipsElfWithJalFallbackTarget(const std::filesystem::path
     return writer.save(elfPath.string());
 }
 
+static bool writeMinimalMipsElfWithExecutableSegmentOverDataSection(
+    const std::filesystem::path &elfPath)
+{
+    ELFIO::elfio writer;
+    writer.create(ELFIO::ELFCLASS32, ELFIO::ELFDATA2LSB);
+    writer.set_type(ELFIO::ET_EXEC);
+    writer.set_machine(ELFIO::EM_MIPS);
+    writer.set_entry(0x00100000u);
+
+    ELFIO::section *overlay = writer.sections.add(".overlay_payload");
+    overlay->set_type(ELFIO::SHT_PROGBITS);
+    overlay->set_flags(ELFIO::SHF_ALLOC);
+    overlay->set_addr_align(4);
+    overlay->set_address(0x01E00000u);
+    const std::array<uint32_t, 2> words = {0x03E00008u, 0x00000000u};
+    overlay->set_data(reinterpret_cast<const char *>(words.data()),
+                      static_cast<ELFIO::Elf_Word>(sizeof(words)));
+
+    ELFIO::segment *segment = writer.segments.add();
+    segment->set_type(ELFIO::PT_LOAD);
+    segment->set_flags(ELFIO::PF_R | ELFIO::PF_X);
+    segment->set_align(4);
+    segment->set_virtual_address(overlay->get_address());
+    segment->set_physical_address(overlay->get_address());
+    segment->add_section_index(overlay->get_index(), overlay->get_addr_align());
+    return writer.save(elfPath.string());
+}
+
 static bool writeMinimalMipsElfWithInitializer(const std::filesystem::path &elfPath,
                                                const std::string &functionName,
                                                uint32_t initializerTarget)
@@ -871,6 +899,28 @@ void register_ps2_recompiler_tests()
 
             t.IsTrue(hasCodeFunction, "function in executable section should be retained");
             t.IsFalse(hasDataFunction, "STT_FUNC symbol in .data must be ignored");
+
+            std::error_code removeError;
+            std::filesystem::remove(elfPath, removeError);
+        });
+
+        tc.Run("elf parser supplements named sections with executable PT_LOAD segments", [](TestCase &t) {
+            const auto uniqueSuffix = std::to_string(
+                static_cast<unsigned long long>(std::chrono::steady_clock::now().time_since_epoch().count()));
+            const std::filesystem::path elfPath =
+                std::filesystem::temp_directory_path() / ("ps2recomp-overlay-segment-" + uniqueSuffix + ".elf");
+
+            t.IsTrue(writeMinimalMipsElfWithExecutableSegmentOverDataSection(elfPath),
+                     "temporary overlay ELF should be generated");
+            ElfParser parser(elfPath.string());
+            t.IsTrue(parser.parse(), "overlay ELF should parse");
+
+            const auto &sections = parser.getSections();
+            const bool hasExecutableOverlay = std::any_of(
+                sections.begin(), sections.end(), [](const Section &section)
+                { return section.address == 0x01E00000u && section.isCode; });
+            t.IsTrue(hasExecutableOverlay,
+                     "executable PT_LOAD should supplement a non-executable named section");
 
             std::error_code removeError;
             std::filesystem::remove(elfPath, removeError);
