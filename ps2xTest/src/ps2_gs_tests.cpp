@@ -1469,6 +1469,62 @@ void register_ps2_gs_tests()
                      "direct CT32 presentation should normalize row 1 alpha for the host frame");
         });
 
+        tc.Run("latched host presentation honors a black display page instead of a colored draw context", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GSRegisters regs{};
+            regs.pmode = 0x0001ull;
+            regs.dispfb1 =
+                0ull |
+                (10ull << 9) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 15);
+            regs.display1 =
+                (639ull << 32) |
+                (447ull << 44);
+
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
+
+            constexpr uint32_t kGreenContextFbp = 150u;
+            constexpr uint64_t kGreenContextFrame =
+                static_cast<uint64_t>(kGreenContextFbp) |
+                (10ull << 16) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 24);
+            constexpr uint32_t kVividGreen = 0x0000FF00u;
+            gs.writeRegister(GS_REG_FRAME_1, kGreenContextFrame);
+            writeReferenceFramePSMCT32Pixel(vram, kGreenContextFbp, 10u, 0u, 0u, kVividGreen);
+
+            gs.latchHostPresentationFrame();
+
+            std::vector<uint8_t> latchedFrame;
+            uint32_t latchedWidth = 0u;
+            uint32_t latchedHeight = 0u;
+            uint32_t displayFbp = 0u;
+            uint32_t sourceFbp = 0u;
+            bool usedPreferred = false;
+            t.IsTrue(gs.copyLatchedHostPresentationFrame(latchedFrame,
+                                                         latchedWidth,
+                                                         latchedHeight,
+                                                         &displayFbp,
+                                                         &sourceFbp,
+                                                         &usedPreferred),
+                     "a configured black display page should remain presentable");
+            t.Equals(displayFbp, 0u,
+                     "presentation should report the active black display page");
+            t.Equals(sourceFbp, 0u,
+                     "presentation should not substitute a colored draw-context page");
+            t.IsFalse(usedPreferred,
+                      "presentation should not claim an unobserved fullscreen-copy source");
+            t.Equals(static_cast<uint32_t>(latchedFrame[0]), 0u,
+                     "black display red should remain black");
+            t.Equals(static_cast<uint32_t>(latchedFrame[1]), 0u,
+                     "black display green should not come from the draw context");
+            t.Equals(static_cast<uint32_t>(latchedFrame[2]), 0u,
+                     "black display blue should remain black");
+            t.Equals(static_cast<uint32_t>(latchedFrame[3]), 0xFFu,
+                     "black display alpha should be normalized for host presentation");
+        });
+
         tc.Run("latched host presentation merges both enabled PMODE circuits", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);

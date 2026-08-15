@@ -266,26 +266,6 @@ namespace
         return GSInternal::clampU8(static_cast<int>(dst) + ((delta * static_cast<int>(factor)) / 255));
     }
 
-    uint32_t countNonBlackPixels(const std::vector<uint8_t> &pixels, uint32_t width, uint32_t height)
-    {
-        uint32_t count = 0u;
-        for (uint32_t y = 0; y < height; ++y)
-        {
-            const uint8_t *row = pixels.data() + (y * kHostFrameWidth * 4u);
-            for (uint32_t x = 0; x < width; ++x)
-            {
-                const uint8_t r = row[x * 4u + 0u];
-                const uint8_t g = row[x * 4u + 1u];
-                const uint8_t b = row[x * 4u + 2u];
-                if (r != 0u || g != 0u || b != 0u)
-                {
-                    ++count;
-                }
-            }
-        }
-        return count;
-    }
-
     bool clearFramebufferRect(GS *gs, const GSContext &ctx, uint32_t rgba)
     {
         if (ctx.frame.fbw == 0u)
@@ -1061,43 +1041,6 @@ void GS::latchHostPresentationFrameUnlocked()
                                          displayOrigin.y))
         {
             return false;
-        }
-
-        if (!usedPreferred && displayFrame.fbp == 0u && countNonBlackPixels(scratch, width, height) == 0u)
-        {
-            for (int contextIndex = 0; contextIndex < 2; ++contextIndex)
-            {
-                const GSFrameReg &candidate = m_ctx[contextIndex].frame;
-                if (candidate.fbp == selectedFrame.fbp &&
-                    candidate.fbw == selectedFrame.fbw &&
-                    candidate.psm == selectedFrame.psm)
-                {
-                    continue;
-                }
-
-                std::vector<uint8_t> candidatePixels;
-                if (!copyFrameToHostRgbaUnlocked(candidate,
-                                                 width,
-                                                 height,
-                                                 candidatePixels,
-                                                 preserveAlpha,
-                                                 true,
-                                                 true,
-                                                 0u,
-                                                 0u))
-                {
-                    continue;
-                }
-
-                if (countNonBlackPixels(candidatePixels, width, height) == 0u)
-                {
-                    continue;
-                }
-
-                selectedFrame = candidate;
-                scratch.swap(candidatePixels);
-                break;
-            }
         }
 
         return true;

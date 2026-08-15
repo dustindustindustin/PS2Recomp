@@ -48,8 +48,10 @@ static constexpr uint32_t DEFAULT_FB_ADDR = (PS2_RAM_SIZE - DEFAULT_FB_SIZE - 0x
 static constexpr int HOST_WINDOW_WIDTH = 960;
 static constexpr int HOST_WINDOW_HEIGHT = 544;
 #else
-static constexpr int HOST_WINDOW_WIDTH = FB_WIDTH;
-static constexpr int HOST_WINDOW_HEIGHT = DEFAULT_DISPLAY_HEIGHT;
+// Start at an exact 2x multiple of the native presentation size.  This makes
+// the original UI legible without changing the emulated GS resolution.
+static constexpr int HOST_WINDOW_WIDTH = FB_WIDTH * 2;
+static constexpr int HOST_WINDOW_HEIGHT = DEFAULT_DISPLAY_HEIGHT * 2;
 #endif
 struct ElfHeader
 {
@@ -811,6 +813,7 @@ bool PS2Runtime::initialize(const char *title)
 #else
         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+        SetWindowMinSize(FB_WIDTH, DEFAULT_DISPLAY_HEIGHT);
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
@@ -2755,6 +2758,12 @@ void PS2Runtime::run()
     Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
     Texture2D frameTex = LoadTextureFromImage(blank);
     UnloadImage(blank);
+#if !defined(PLATFORM_VITA)
+    // Point filtering is the default so integer-sized windows keep PS2 text
+    // and UI pixels crisp. F9 lets the player opt into smoother scaling.
+    bool useBilinearScaling = false;
+    SetTextureFilter(frameTex, TEXTURE_FILTER_POINT);
+#endif
 
     g_activeThreads.store(1, std::memory_order_relaxed);
     std::atomic<bool> gameThreadFinished{false};
@@ -2786,6 +2795,7 @@ void PS2Runtime::run()
     uint64_t hostFrame = 0;
     const bool automatedStart = std::getenv("PS2X_AUTOMATED_PAD_START") != nullptr;
     const bool automatedNewGame = std::getenv("PS2X_AUTOMATED_NEW_GAME") != nullptr;
+    const bool automatedContinue = std::getenv("PS2X_AUTOMATED_CONTINUE") != nullptr;
     uint64_t automatedNewGameFrame = 3600u;
     if (const char *configuredFrame = std::getenv("PS2X_AUTOMATED_NEW_GAME_FRAME");
         configuredFrame != nullptr && *configuredFrame != '\0')
@@ -2795,19 +2805,38 @@ void PS2Runtime::run()
         if (end != configuredFrame && *end == '\0' && parsed >= 120u)
             automatedNewGameFrame = static_cast<uint64_t>(parsed);
     }
+    uint64_t automatedContinueFrame = 3600u;
+    if (const char *configuredFrame = std::getenv("PS2X_AUTOMATED_CONTINUE_FRAME");
+        configuredFrame != nullptr && *configuredFrame != '\0')
+    {
+        char *end = nullptr;
+        const unsigned long long parsed = std::strtoull(configuredFrame, &end, 0);
+        if (end != configuredFrame && *end == '\0' && parsed >= 120u)
+            automatedContinueFrame = static_cast<uint64_t>(parsed);
+    }
     bool reportedAutomatedStart = false;
     bool reportedAutomatedCross = false;
+    bool reportedAutomatedDown = false;
     while (!isStopRequested() && g_activeThreads.load(std::memory_order_relaxed) > 0)
     {
         ++hostFrame;
-        if (automatedStart || automatedNewGame)
+        if (automatedStart || automatedNewGame || automatedContinue)
         {
             const bool pressCross =
-                automatedNewGame && hostFrame >= automatedNewGameFrame &&
-                ((hostFrame - automatedNewGameFrame) % 120u) < 6u;
+                (automatedNewGame && hostFrame >= automatedNewGameFrame &&
+                 ((hostFrame - automatedNewGameFrame) % 120u) < 6u) ||
+                (automatedContinue &&
+                 ((hostFrame >= automatedContinueFrame + 60u &&
+                   hostFrame < automatedContinueFrame + 66u) ||
+                  (hostFrame >= automatedContinueFrame + 600u &&
+                   hostFrame < automatedContinueFrame + 606u)));
+            const bool pressDown =
+                automatedContinue && hostFrame >= automatedContinueFrame &&
+                hostFrame < automatedContinueFrame + 6u;
             const bool pressStart =
-                !pressCross && hostFrame >= 120u &&
+                !pressCross && !pressDown && hostFrame >= 120u &&
                 (!automatedNewGame || hostFrame < automatedNewGameFrame) &&
+                (!automatedContinue || hostFrame < automatedContinueFrame) &&
                 (hostFrame % 60u) < 6u;
             if (pressCross)
             {
@@ -2816,6 +2845,15 @@ void PS2Runtime::run()
                 {
                     std::cout << "[automated-input] Cross pressed at host frame " << hostFrame << std::endl;
                     reportedAutomatedCross = true;
+                }
+            }
+            else if (pressDown)
+            {
+                ps2_stubs::setPadOverrideState(0xFFBFu, 0x80u, 0x80u, 0x80u, 0x80u);
+                if (!reportedAutomatedDown)
+                {
+                    std::cout << "[automated-input] Down pressed at host frame " << hostFrame << std::endl;
+                    reportedAutomatedDown = true;
                 }
             }
             else if (pressStart)
@@ -2888,6 +2926,25 @@ void PS2Runtime::run()
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
         UploadFrame(frameTex, this, presentWidth, presentHeight);
+
+#if !defined(PLATFORM_VITA)
+        // F11 and Alt+Enter are the conventional fullscreen shortcuts. F9
+        // switches between crisp nearest-neighbour and smooth bilinear output.
+        if (IsKeyPressed(KEY_F11) ||
+            (IsKeyDown(KEY_LEFT_ALT) && IsKeyPressed(KEY_ENTER)) ||
+            (IsKeyDown(KEY_RIGHT_ALT) && IsKeyPressed(KEY_ENTER)))
+        {
+            ToggleFullscreen();
+        }
+        if (IsKeyPressed(KEY_F9))
+        {
+            useBilinearScaling = !useBilinearScaling;
+            SetTextureFilter(frameTex,
+                             useBilinearScaling ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
+            RUNTIME_LOG("[display] scaling filter="
+                        << (useBilinearScaling ? "bilinear" : "nearest"));
+        }
+#endif
 
         BeginDrawing();
         ClearBackground(BLACK);
