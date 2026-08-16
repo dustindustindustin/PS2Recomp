@@ -1149,6 +1149,9 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
 
 namespace
 {
+    std::mutex g_sparseFunctionMutex;
+    std::unordered_map<uint32_t, PS2Runtime::RecompiledFunction> g_sparseFunctions;
+
     bool generatedFunctionTableSlot(uint32_t address, uint32_t &slot)
     {
         if ((address & 3u) != 0u || g_ps2RecompiledFunctionTableSlotCount == 0u)
@@ -1170,16 +1173,21 @@ namespace
 bool PS2Runtime::replaceFunction(uint32_t address, RecompiledFunction func)
 {
     uint32_t slot = 0u;
-    if (!generatedFunctionTableSlot(address, slot))
+    if (generatedFunctionTableSlot(address, slot))
     {
-        std::cerr << "[function-table] cannot replace guest PC 0x" << std::hex << address
-                  << ": outside generated dense table [0x" << g_ps2RecompiledFunctionTableBase
-                  << ", 0x" << g_ps2RecompiledFunctionTableEnd << ")"
-                  << std::dec << std::endl;
+        g_ps2RecompiledFunctionTable[slot] = func;
+        return true;
+    }
+
+    if ((address & 3u) != 0u || address >= PS2_RAM_SIZE || func == nullptr)
+    {
+        std::cerr << "[function-table] cannot replace invalid guest PC 0x"
+                  << std::hex << address << std::dec << std::endl;
         return false;
     }
 
-    g_ps2RecompiledFunctionTable[slot] = func;
+    const std::lock_guard<std::mutex> lock(g_sparseFunctionMutex);
+    g_sparseFunctions[address] = func;
     return true;
 }
 
@@ -1191,7 +1199,13 @@ bool PS2Runtime::registerFunction(uint32_t address, RecompiledFunction func)
 bool PS2Runtime::hasFunction(uint32_t address) const
 {
     uint32_t slot = 0u;
-    return generatedFunctionTableSlot(address, slot) && g_ps2RecompiledFunctionTable[slot] != nullptr;
+    if (generatedFunctionTableSlot(address, slot))
+    {
+        return g_ps2RecompiledFunctionTable[slot] != nullptr;
+    }
+
+    const std::lock_guard<std::mutex> lock(g_sparseFunctionMutex);
+    return g_sparseFunctions.contains(address);
 }
 
 const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
@@ -1224,6 +1238,15 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
         if (fn != nullptr)
         {
             return fn;
+        }
+    }
+
+    {
+        const std::lock_guard<std::mutex> lock(g_sparseFunctionMutex);
+        const auto sparse = g_sparseFunctions.find(address);
+        if (sparse != g_sparseFunctions.end())
+        {
+            return sparse->second;
         }
     }
 
@@ -2796,6 +2819,8 @@ void PS2Runtime::run()
     const bool automatedStart = std::getenv("PS2X_AUTOMATED_PAD_START") != nullptr;
     const bool automatedNewGame = std::getenv("PS2X_AUTOMATED_NEW_GAME") != nullptr;
     const bool automatedContinue = std::getenv("PS2X_AUTOMATED_CONTINUE") != nullptr;
+    const bool automatedLevelSelect =
+        std::getenv("PS2X_AUTOMATED_LEVEL_SELECT") != nullptr;
     uint64_t automatedNewGameFrame = 3600u;
     if (const char *configuredFrame = std::getenv("PS2X_AUTOMATED_NEW_GAME_FRAME");
         configuredFrame != nullptr && *configuredFrame != '\0')
@@ -2814,15 +2839,30 @@ void PS2Runtime::run()
         if (end != configuredFrame && *end == '\0' && parsed >= 120u)
             automatedContinueFrame = static_cast<uint64_t>(parsed);
     }
+    uint64_t automatedLevelSelectFrame = automatedContinueFrame + 1800u;
+    if (const char *configuredFrame = std::getenv("PS2X_AUTOMATED_LEVEL_SELECT_FRAME");
+        configuredFrame != nullptr && *configuredFrame != '\0')
+    {
+        char *end = nullptr;
+        const unsigned long long parsed = std::strtoull(configuredFrame, &end, 0);
+        if (end != configuredFrame && *end == '\0' && parsed >= 120u)
+            automatedLevelSelectFrame = static_cast<uint64_t>(parsed);
+    }
     bool reportedAutomatedStart = false;
     bool reportedAutomatedCross = false;
     bool reportedAutomatedDown = false;
+    bool reportedAutomatedLevelSelect = false;
     while (!isStopRequested() && g_activeThreads.load(std::memory_order_relaxed) > 0)
     {
         ++hostFrame;
-        if (automatedStart || automatedNewGame || automatedContinue)
+        if (automatedStart || automatedNewGame || automatedContinue ||
+            automatedLevelSelect)
         {
+            const bool pressLevelSelect =
+                automatedLevelSelect && hostFrame >= automatedLevelSelectFrame &&
+                hostFrame < automatedLevelSelectFrame + 6u;
             const bool pressCross =
+                pressLevelSelect ||
                 (automatedNewGame && hostFrame >= automatedNewGameFrame &&
                  ((hostFrame - automatedNewGameFrame) % 120u) < 6u) ||
                 (automatedContinue &&
@@ -2841,6 +2881,12 @@ void PS2Runtime::run()
             if (pressCross)
             {
                 ps2_stubs::setPadOverrideState(0xBFFFu, 0x80u, 0x80u, 0x80u, 0x80u);
+                if (pressLevelSelect && !reportedAutomatedLevelSelect)
+                {
+                    std::cout << "[automated-input] Enemy level selected at host frame "
+                              << hostFrame << std::endl;
+                    reportedAutomatedLevelSelect = true;
+                }
                 if (!reportedAutomatedCross)
                 {
                     std::cout << "[automated-input] Cross pressed at host frame " << hostFrame << std::endl;
