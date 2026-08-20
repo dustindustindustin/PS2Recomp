@@ -505,6 +505,15 @@ target_include_directories(ps2_runtime PUBLIC
 )
 
 target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
+
+# Recompiled guest functions can have large native stack frames, and guest
+# calls remain nested while dispatching between generated functions. The
+# Windows default 1 MiB thread stack is too small for valid execution paths
+# such as multi-stage battle animations, so propagate a larger reserve.
+if(MSVC AND NOT PS2X_IS_ANDROID AND NOT PS2X_IS_VITA)
+    target_link_options(ps2_runtime INTERFACE "/STACK:16777216")
+endif()
+
 target_link_libraries(ps2EntryRunner
     PRIVATE
     ps2_runtime
