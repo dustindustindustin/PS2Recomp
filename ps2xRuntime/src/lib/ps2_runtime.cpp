@@ -29,6 +29,15 @@
 #include <unordered_map>
 #include <sstream>
 
+#if PS2X_HAS_FFMPEG
+extern "C"
+{
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libswscale/swscale.h>
+}
+#endif
+
 namespace ps2_stubs
 {
     void resetSifState();
@@ -42,6 +51,144 @@ namespace ps2_stubs
 static constexpr int FB_WIDTH = 640;
 static constexpr int FB_HEIGHT = 512;
 static constexpr int DEFAULT_DISPLAY_HEIGHT = 448;
+
+#if PS2X_HAS_FFMPEG && !defined(PLATFORM_VITA)
+namespace
+{
+class HostStartupVideo
+{
+public:
+    ~HostStartupVideo() { close(); }
+
+    bool open(const char *path)
+    {
+        if (!path || !*path || avformat_open_input(&format_, path, nullptr, nullptr) < 0 ||
+            avformat_find_stream_info(format_, nullptr) < 0)
+            return false;
+        stream_ = av_find_best_stream(format_, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+        if (stream_ < 0)
+            return false;
+        const AVCodec *codec = avcodec_find_decoder(format_->streams[stream_]->codecpar->codec_id);
+        context_ = codec ? avcodec_alloc_context3(codec) : nullptr;
+        if (!context_ || avcodec_parameters_to_context(context_, format_->streams[stream_]->codecpar) < 0 ||
+            avcodec_open2(context_, codec, nullptr) < 0)
+            return false;
+        frame_ = av_frame_alloc();
+        packet_ = av_packet_alloc();
+        rgba_.resize(static_cast<size_t>(context_->width) * context_->height * 4u);
+        scaler_ = sws_getContext(context_->width, context_->height, context_->pix_fmt,
+                                 context_->width, context_->height, AV_PIX_FMT_RGBA,
+                                 SWS_BILINEAR, nullptr, nullptr, nullptr);
+        if (!frame_ || !packet_ || !scaler_)
+            return false;
+        Image image{rgba_.data(), context_->width, context_->height, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+        texture_ = LoadTextureFromImage(image);
+        start_ = std::chrono::steady_clock::now();
+        active_ = texture_.id != 0;
+        std::cout << "[startup-video] playing " << path << " (" << context_->width
+                  << 'x' << context_->height << ")\n";
+        return active_;
+    }
+
+    bool active() const { return active_; }
+    const Texture2D &texture() const { return texture_; }
+    int width() const { return context_ ? context_->width : 0; }
+    int height() const { return context_ ? context_->height : 0; }
+    void skip()
+    {
+        if (active_)
+            std::cout << "[startup-video] skipped by Start\n";
+        active_ = false;
+    }
+
+    void update()
+    {
+        if (!active_)
+            return;
+        const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_).count();
+        while (nextFrameSeconds_ <= elapsed && decodeOne()) {}
+    }
+
+private:
+    bool decodeOne()
+    {
+        for (;;)
+        {
+            int result = avcodec_receive_frame(context_, frame_);
+            if (result == 0)
+            {
+                uint8_t *dst[] = {rgba_.data()};
+                int stride[] = {context_->width * 4};
+                sws_scale(scaler_, frame_->data, frame_->linesize, 0, context_->height, dst, stride);
+                UpdateTexture(texture_, rgba_.data());
+                const AVRational timeBase = format_->streams[stream_]->time_base;
+                if (frame_->best_effort_timestamp != AV_NOPTS_VALUE)
+                    nextFrameSeconds_ = frame_->best_effort_timestamp * av_q2d(timeBase);
+                else
+                    nextFrameSeconds_ += 1.0 / 29.97;
+                return true;
+            }
+            if (result != AVERROR(EAGAIN))
+            {
+                if (av_seek_frame(format_, stream_, 0, AVSEEK_FLAG_BACKWARD) >= 0)
+                {
+                    avcodec_flush_buffers(context_);
+                    start_ = std::chrono::steady_clock::now();
+                    nextFrameSeconds_ = 0.0;
+                    std::cout << "[startup-video] looping until Start\n";
+                    continue;
+                }
+                active_ = false;
+                return false;
+            }
+            bool submitted = false;
+            while (av_read_frame(format_, packet_) >= 0)
+            {
+                if (packet_->stream_index == stream_)
+                {
+                    result = avcodec_send_packet(context_, packet_);
+                    av_packet_unref(packet_);
+                    if (result >= 0 || result == AVERROR(EAGAIN))
+                    {
+                        submitted = true;
+                        break;
+                    }
+                }
+                else
+                    av_packet_unref(packet_);
+            }
+            if (!submitted)
+                avcodec_send_packet(context_, nullptr);
+        }
+    }
+
+    void close()
+    {
+        if (texture_.id)
+            UnloadTexture(texture_);
+        if (scaler_)
+            sws_freeContext(scaler_);
+        av_frame_free(&frame_);
+        av_packet_free(&packet_);
+        avcodec_free_context(&context_);
+        if (format_)
+            avformat_close_input(&format_);
+    }
+
+    AVFormatContext *format_ = nullptr;
+    AVCodecContext *context_ = nullptr;
+    SwsContext *scaler_ = nullptr;
+    AVFrame *frame_ = nullptr;
+    AVPacket *packet_ = nullptr;
+    Texture2D texture_{};
+    std::vector<uint8_t> rgba_;
+    std::chrono::steady_clock::time_point start_{};
+    double nextFrameSeconds_ = 0.0;
+    int stream_ = -1;
+    bool active_ = false;
+};
+}
+#endif
 static constexpr uint32_t DEFAULT_FB_SIZE = FB_WIDTH * FB_HEIGHT * 4;
 static constexpr uint32_t DEFAULT_FB_ADDR = (PS2_RAM_SIZE - DEFAULT_FB_SIZE - 0x10000u);
 #if defined(PLATFORM_VITA)
@@ -2781,6 +2928,14 @@ void PS2Runtime::run()
     Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
     Texture2D frameTex = LoadTextureFromImage(blank);
     UnloadImage(blank);
+#if PS2X_HAS_FFMPEG && !defined(PLATFORM_VITA)
+    HostStartupVideo startupVideo;
+    if (const char *startupPath = std::getenv("PS2X_STARTUP_VIDEO");
+        startupPath && *startupPath && !startupVideo.open(startupPath))
+    {
+        std::cerr << "[startup-video] could not open " << startupPath << '\n';
+    }
+#endif
 #if !defined(PLATFORM_VITA)
     // Point filtering is the default so integer-sized windows keep PS2 text
     // and UI pixels crisp. F9 lets the player opt into smoother scaling.
@@ -2855,6 +3010,14 @@ void PS2Runtime::run()
     while (!isStopRequested() && g_activeThreads.load(std::memory_order_relaxed) > 0)
     {
         ++hostFrame;
+#if PS2X_HAS_FFMPEG && !defined(PLATFORM_VITA)
+        const bool startupWasActive = startupVideo.active();
+        if (startupWasActive &&
+            (IsKeyPressed(KEY_ENTER) ||
+             (IsGamepadAvailable(0) && IsGamepadButtonPressed(0, GAMEPAD_BUTTON_MIDDLE_RIGHT))))
+            startupVideo.skip();
+        startupVideo.update();
+#endif
         if (automatedStart || automatedNewGame || automatedContinue ||
             automatedLevelSelect)
         {
@@ -2875,9 +3038,7 @@ void PS2Runtime::run()
                 hostFrame < automatedContinueFrame + 6u;
             const bool pressStart =
                 !pressCross && !pressDown && hostFrame >= 120u &&
-                (!automatedNewGame || hostFrame < automatedNewGameFrame) &&
-                (!automatedContinue || hostFrame < automatedContinueFrame) &&
-                (hostFrame % 60u) < 6u;
+                hostFrame < 126u;
             if (pressCross)
             {
                 ps2_stubs::setPadOverrideState(0xBFFFu, 0x80u, 0x80u, 0x80u, 0x80u);
@@ -3007,7 +3168,24 @@ void PS2Runtime::run()
             (screenHeight - dstHeight) * 0.5f,
             dstWidth,
             dstHeight};
-        DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+#if PS2X_HAS_FFMPEG && !defined(PLATFORM_VITA)
+        if (startupVideo.active())
+        {
+            const float movieWidth = static_cast<float>(std::max(1, startupVideo.width()));
+            const float movieHeight = static_cast<float>(std::max(1, startupVideo.height()));
+            const float movieScale = std::min(screenWidth / movieWidth, screenHeight / movieHeight);
+            const Rectangle movieSource{0.0f, 0.0f, movieWidth, movieHeight};
+            const Rectangle movieDest{(screenWidth - movieWidth * movieScale) * 0.5f,
+                                      (screenHeight - movieHeight * movieScale) * 0.5f,
+                                      movieWidth * movieScale, movieHeight * movieScale};
+            DrawTexturePro(startupVideo.texture(), movieSource, movieDest,
+                           Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        }
+        else
+#endif
+        {
+            DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        }
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);
