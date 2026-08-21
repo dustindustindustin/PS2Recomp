@@ -91,6 +91,7 @@ namespace ps2x::iop
         bool handled = false;
         uint32_t resultAddress = 0;
         bool signalNowaitCompletion = false;
+        bool deferNowaitCompletion = false;
         bool signalCompletion = false;
         CallbackPolicy callbackPolicy = CallbackPolicy::RuntimeDefault;
         ServerDispatchPolicy serverDispatchPolicy = ServerDispatchPolicy::RuntimeDefault;

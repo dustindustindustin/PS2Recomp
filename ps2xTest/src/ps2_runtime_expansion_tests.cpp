@@ -1976,10 +1976,11 @@ void register_ps2_runtime_expansion_tests()
             gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE));
             gs.writeRegister(GS_REG_RGBAQ, 0xFF3214C8ull); // RGBA=(200,20,50,255)
 
-            // With XYOFFSET=(1,1), vertex at (2,2) draws to pixel (1,1).
-            const uint64_t xyz = (32ull) | (32ull << 16) | (0ull << 32);
-            gs.writeRegister(GS_REG_XYZ2, xyz);
-            gs.writeRegister(GS_REG_XYZ2, xyz);
+            // With XYOFFSET=(1,1), the (2,2)-(3,3) sprite draws pixel (1,1).
+            const uint64_t xyz0 = (32ull) | (32ull << 16) | (0ull << 32);
+            const uint64_t xyz1 = (48ull) | (48ull << 16) | (0ull << 32);
+            gs.writeRegister(GS_REG_XYZ2, xyz0);
+            gs.writeRegister(GS_REG_XYZ2, xyz1);
 
             const uint32_t insideOff = frameOffsetBytes(1u, 1u, 1u);
             t.Equals(vram[insideOff + 0u], static_cast<uint8_t>(200u), "inside draw should write R");
@@ -1992,8 +1993,8 @@ void register_ps2_runtime_expansion_tests()
             // Move scissor so target pixel is fully outside.
             const uint64_t scissorOutside = (3ull) | (4ull << 16) | (3ull << 32) | (4ull << 48);
             gs.writeRegister(GS_REG_SCISSOR_1, scissorOutside);
-            gs.writeRegister(GS_REG_XYZ2, xyz);
-            gs.writeRegister(GS_REG_XYZ2, xyz);
+            gs.writeRegister(GS_REG_XYZ2, xyz0);
+            gs.writeRegister(GS_REG_XYZ2, xyz1);
 
             bool anyWrite = false;
             for (size_t i = 0; i < 1024u; ++i)
@@ -2040,9 +2041,11 @@ void register_ps2_runtime_expansion_tests()
             gs.writeRegister(GS_REG_ALPHA_1, alpha);
             gs.writeRegister(GS_REG_RGBAQ, 0xFFC8C8C8ull); // src RGB = 200
 
-            const uint64_t xyz = (16ull) | (16ull << 16) | (0ull << 32); // pixel (1,1)
-            gs.writeRegister(GS_REG_XYZ2, xyz);
-            gs.writeRegister(GS_REG_XYZ2, xyz);
+            // A nonzero (1,1)-(2,2) sprite covers pixel (1,1).
+            const uint64_t xyz0 = (16ull) | (16ull << 16) | (0ull << 32);
+            const uint64_t xyz1 = (32ull) | (32ull << 16) | (0ull << 32);
+            gs.writeRegister(GS_REG_XYZ2, xyz0);
+            gs.writeRegister(GS_REG_XYZ2, xyz1);
 
             // ((200 - 40) * 64 >> 7) + 40 = 120
             t.Equals(vram[pxOff + 0u], static_cast<uint8_t>(120u), "alpha blend should update R with FIX factor");

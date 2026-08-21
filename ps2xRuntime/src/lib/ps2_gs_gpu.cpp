@@ -12,7 +12,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 
@@ -36,6 +38,44 @@ namespace
         prim.ctxt = ((value >> 9) & 1u) != 0u;
         prim.fix = ((value >> 10) & 1u) != 0u;
         return prim;
+    }
+
+    bool isIndexedTexturePsm(uint8_t psm)
+    {
+        switch (psm)
+        {
+        case GS_PSM_T8:
+        case GS_PSM_T8H:
+        case GS_PSM_T4:
+        case GS_PSM_T4HL:
+        case GS_PSM_T4HH:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    uint32_t clutLoadEntryCount(uint8_t psm)
+    {
+        switch (psm)
+        {
+        case GS_PSM_T8:
+        case GS_PSM_T8H:
+            return 256u;
+        case GS_PSM_T4:
+        case GS_PSM_T4HL:
+        case GS_PSM_T4HH:
+            return 16u;
+        default:
+            return 0u;
+        }
+    }
+
+    uint32_t swizzleClutIndexCSM1(uint32_t index)
+    {
+        // CSM1 exchanges address bits 3 and 4 when fetching the palette
+        // from the upper-left of the buffer at CBP.
+        return (index & ~0x18u) | ((index & 0x08u) << 1u) | ((index & 0x10u) >> 1u);
     }
 
     uint16_t encodeFramePixelPSMCT16(uint8_t r, uint8_t g, uint8_t b, uint8_t a)
@@ -202,47 +242,6 @@ namespace
         return pmode;
     }
 
-    struct GSSmode2State
-    {
-        bool interlaced = false;
-        bool frameMode = true;
-    };
-
-    GSSmode2State decodeSMode2(uint64_t smode264)
-    {
-        GSSmode2State smode2{};
-        smode2.interlaced = (smode264 & 0x1ull) != 0ull;
-        smode2.frameMode = ((smode264 >> 1) & 0x1ull) != 0ull;
-        return smode2;
-    }
-
-    void applyFieldPresentation(std::vector<uint8_t> &pixels, uint32_t width, uint32_t height, bool oddField)
-    {
-        if (pixels.empty() || width == 0u || height < 2u)
-        {
-            return;
-        }
-
-        // Present one stable field on progressive host displays. Alternating
-        // the source parity every VSync produces a visible one-line vertical
-        // bob in static interlaced content such as title and menu screens.
-        // The guest still observes normal field parity through GS timing.
-        (void)oddField;
-        const std::vector<uint8_t> source = pixels;
-        for (uint32_t y = 0; y < height; ++y)
-        {
-            uint32_t sourceY = (y >> 1u) << 1u;
-            if (sourceY >= height)
-            {
-                sourceY = height - 1u;
-            }
-
-            const uint8_t *srcRow = source.data() + (sourceY * kHostFrameWidth * 4u);
-            uint8_t *dstRow = pixels.data() + (y * kHostFrameWidth * 4u);
-            std::memcpy(dstRow, srcRow, width * 4u);
-        }
-    }
-
     void normalizePresentationAlpha(std::vector<uint8_t> &pixels, uint32_t width, uint32_t height)
     {
         if (pixels.empty() || width == 0u || height == 0u)
@@ -262,8 +261,13 @@ namespace
 
     uint8_t blendPresentationChannel(uint8_t src, uint8_t dst, uint32_t factor)
     {
+        // GS alpha is a 1.7 fixed-point value: 0x80 represents 1.0.  PMODE
+        // uses the same scale as the drawing pipeline.  Treating 0xff as 1.0
+        // made the common 0x7f flicker-filter setting a 50/50 blend instead
+        // of an almost fully weighted RC1 sample, causing intermittent
+        // half-bright presentation frames during read-circuit swaps.
         const int delta = static_cast<int>(src) - static_cast<int>(dst);
-        return GSInternal::clampU8(static_cast<int>(dst) + ((delta * static_cast<int>(factor)) / 255));
+        return GSInternal::clampU8(static_cast<int>(dst) + ((delta * static_cast<int>(factor)) / 128));
     }
 
     bool clearFramebufferRect(GS *gs, const GSContext &ctx, uint32_t rgba)
@@ -462,8 +466,14 @@ void GS::reset()
     m_fogB = 0;
     m_prmodecont = true;
     m_pabe = false;
+    m_dimx = {};
+    m_dthe = false;
+    m_colclamp = false;
     m_texa = {0u, false, 0u};
     m_texclut = {0u, 0u, 0u};
+    m_clut.fill(0u);
+    m_clutCbp0 = 0u;
+    m_clutCbp1 = 0u;
     m_bitbltbuf = {};
     m_trxpos = {};
     m_trxreg = {};
@@ -475,13 +485,17 @@ void GS::reset()
     m_preferredDisplaySourceFrame = {};
     m_preferredDisplayDestFbp = 0;
     m_hasPreferredDisplaySource = false;
-    m_hostPresentationFrame.clear();
-    m_hostPresentationWidth = 0u;
-    m_hostPresentationHeight = 0u;
-    m_hostPresentationDisplayFbp = 0u;
-    m_hostPresentationSourceFbp = 0u;
-    m_hostPresentationUsedPreferred = false;
-    m_hasHostPresentationFrame = false;
+    {
+        std::lock_guard<std::mutex> presentationLock(m_hostPresentationMutex);
+        m_hostPresentationFrame.clear();
+        m_hostPresentationWidth = 0u;
+        m_hostPresentationHeight = 0u;
+        m_hostPresentationDisplayFbp = 0u;
+        m_hostPresentationSourceFbp = 0u;
+        m_hostPresentationUsedPreferred = false;
+        m_hasHostPresentationFrame = false;
+        m_hostPresentationGeneration = 0u;
+    }
     m_nativeImageUploadCount = 0;
     m_nativePackedGIFPacketCount = 0;
     m_gifPacketCount = 0;
@@ -506,6 +520,106 @@ void GS::reset()
 GSContext &GS::activeContext()
 {
     return m_ctx[m_prim.ctxt ? 1 : 0];
+}
+
+void GS::updateClut(const GSTex0Reg &tex0)
+{
+    // CBP0/CBP1 are only affected by indexed-texture CLUT requests. Several
+    // games issue CLD writes for direct-color textures, which the GS ignores.
+    if (!isIndexedTexturePsm(tex0.psm))
+    {
+        return;
+    }
+
+    bool shouldLoad = false;
+    switch (tex0.cld)
+    {
+    case 0:
+    case 6:
+    case 7:
+        return;
+    case 1:
+        shouldLoad = true;
+        break;
+    case 2:
+        shouldLoad = true;
+        m_clutCbp0 = tex0.cbp;
+        break;
+    case 3:
+        shouldLoad = true;
+        m_clutCbp1 = tex0.cbp;
+        break;
+    case 4:
+        shouldLoad = m_clutCbp0 != tex0.cbp;
+        m_clutCbp0 = tex0.cbp;
+        break;
+    case 5:
+        shouldLoad = m_clutCbp1 != tex0.cbp;
+        m_clutCbp1 = tex0.cbp;
+        break;
+    default:
+        return;
+    }
+
+    if (shouldLoad)
+    {
+        loadClut(tex0);
+    }
+}
+
+void GS::loadClut(const GSTex0Reg &tex0)
+{
+    if (!m_vram)
+    {
+        return;
+    }
+
+    const uint32_t entryCount = clutLoadEntryCount(tex0.psm);
+    if (entryCount == 0u)
+    {
+        return;
+    }
+
+    const bool is32BitClut = tex0.cpsm == GS_PSM_CT32 || tex0.cpsm == GS_PSM_CT24;
+    const bool is16BitClut = tex0.cpsm == GS_PSM_CT16 || tex0.cpsm == GS_PSM_CT16S;
+    if (!is32BitClut && !is16BitClut)
+    {
+        return;
+    }
+
+    const uint32_t logicalMask = is32BitClut ? 0xFFu : 0x1FFu;
+    const uint32_t csaMask = is32BitClut ? 0x0Fu : 0x1Fu;
+    const uint32_t logicalBase = (static_cast<uint32_t>(tex0.csa) & csaMask) << 4u;
+    const uint32_t csm2BaseX = static_cast<uint32_t>(m_texclut.cou) << 4u;
+    const uint32_t csm2BaseY = static_cast<uint32_t>(m_texclut.cov);
+    const uint32_t sourceWidth = tex0.csm != 0u
+                                     ? std::max<uint32_t>(static_cast<uint32_t>(m_texclut.cbw), 1u)
+                                     : 1u;
+
+    for (uint32_t i = 0u; i < entryCount; ++i)
+    {
+        uint32_t sourceX;
+        uint32_t sourceY;
+        if (tex0.csm == 0u)
+        {
+            const uint32_t sourceIndex = swizzleClutIndexCSM1(i);
+            sourceX = sourceIndex & 0x0Fu;
+            sourceY = sourceIndex >> 4u;
+        }
+        else
+        {
+            sourceX = csm2BaseX + i;
+            sourceY = csm2BaseY;
+        }
+
+        const uint32_t color = ReadVram(tex0.cpsm, tex0.cbp, sourceWidth, sourceX, sourceY);
+        const uint32_t logicalIndex = (logicalBase + i) & logicalMask;
+        m_clut[logicalIndex] = static_cast<uint16_t>(color & 0xFFFFu);
+        if (is32BitClut)
+        {
+            m_clut[logicalIndex + 256u] = static_cast<uint16_t>((color >> 16u) & 0xFFFFu);
+        }
+    }
 }
 
 void GS::snapshotVRAM()
@@ -541,6 +655,9 @@ GSDebugSnapshot GS::getDebugSnapshot() const
     snapshot.prim = m_prim;
     snapshot.texa = m_texa;
     snapshot.texclut = m_texclut;
+    snapshot.dimx = m_dimx;
+    snapshot.dthe = m_dthe;
+    snapshot.colclamp = m_colclamp;
     snapshot.bitbltbuf = m_bitbltbuf;
     snapshot.trxpos = m_trxpos;
     snapshot.trxreg = m_trxreg;
@@ -615,6 +732,8 @@ GSDebugHistoryEntry GS::makeDebugEventUnlocked(GSDebugEventKind kind) const
     entry.zbuf = m_ctx[ci].zbuf;
     entry.tex0 = m_ctx[ci].tex0;
     entry.scissor = m_ctx[ci].scissor;
+    entry.tex1 = m_ctx[ci].tex1;
+    entry.clamp = m_ctx[ci].clamp;
     entry.test = m_ctx[ci].test;
     entry.alpha = m_ctx[ci].alpha;
     entry.bitbltbuf = m_bitbltbuf;
@@ -718,11 +837,6 @@ void GS::recordDrawDebugEventUnlocked(int vertexCount)
 {
     if (vertexCount > 0)
         ++m_drawCount;
-    if (m_debugHistoryPaused)
-    {
-        return;
-    }
-
     if (vertexCount <= 0)
     {
         return;
@@ -748,6 +862,46 @@ void GS::recordDrawDebugEventUnlocked(int vertexCount)
         entry.zMax = std::max(entry.zMax, v.z);
         entry.aMin = std::min(entry.aMin, v.a);
         entry.aMax = std::max(entry.aMax, v.a);
+    }
+
+    if (const char *drawDumpPath = std::getenv("PS2X_GS_DRAW_DUMP");
+        drawDumpPath != nullptr && *drawDumpPath != '\0')
+    {
+        const std::ios::openmode mode = std::ios::out |
+                                        ((m_drawCount == 1u) ? std::ios::trunc : std::ios::app);
+        std::ofstream dump(drawDumpPath, mode);
+        if (dump)
+        {
+            const uint8_t mmag = static_cast<uint8_t>((entry.tex1 >> 5u) & 0x1u);
+            const uint8_t mmin = static_cast<uint8_t>((entry.tex1 >> 6u) & 0x7u);
+            dump << "draw=" << m_drawCount
+                 << " tick=" << ps2_syscalls::GetCurrentVSyncTick()
+                 << " prim=" << static_cast<unsigned int>(entry.prim.type)
+                 << " tme=" << static_cast<unsigned int>(entry.prim.tme)
+                 << " abe=" << static_cast<unsigned int>(entry.prim.abe)
+                 << " fst=" << static_cast<unsigned int>(entry.prim.fst)
+                 << " ctxt=" << static_cast<unsigned int>(entry.prim.ctxt)
+                 << " xy=" << entry.xMin << ',' << entry.yMin
+                 << ".." << entry.xMax << ',' << entry.yMax
+                 << " frame=" << entry.frame.fbp << '/' << entry.frame.fbw
+                 << "/0x" << std::hex << static_cast<unsigned int>(entry.frame.psm) << std::dec
+                 << " tex=" << entry.tex0.tbp0 << '/' << static_cast<unsigned int>(entry.tex0.tbw)
+                 << "/0x" << std::hex << static_cast<unsigned int>(entry.tex0.psm) << std::dec
+                 << " cbp=" << entry.tex0.cbp
+                 << " cpsm=0x" << std::hex << static_cast<unsigned int>(entry.tex0.cpsm) << std::dec
+                 << " tex1=0x" << std::hex << entry.tex1 << std::dec
+                 << " mmag=" << static_cast<unsigned int>(mmag)
+                 << " mmin=" << static_cast<unsigned int>(mmin)
+                 << " clamp=0x" << std::hex << entry.clamp
+                 << " alpha=0x" << entry.alpha
+                 << " test=0x" << entry.test << std::dec
+                 << '\n';
+        }
+    }
+
+    if (m_debugHistoryPaused)
+    {
+        return;
     }
 
     recordDebugEventUnlocked(entry);
@@ -916,9 +1070,13 @@ bool GS::copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
                     const uint32_t r = c & 31u;
                     const uint32_t g = (c >> 5) & 31u;
                     const uint32_t b = (c >> 10) & 31u;
-                    dst[x * 4u + 0u] = static_cast<uint8_t>((r << 3) | (r >> 2));
-                    dst[x * 4u + 1u] = static_cast<uint8_t>((g << 3) | (g >> 2));
-                    dst[x * 4u + 2u] = static_cast<uint8_t>((b << 3) | (b >> 2));
+                    // GS framebuffer readback exposes the stored five-bit
+                    // channels in bits 7:3.  The low three bits remain zero;
+                    // replicating the high bits here makes CT16 scanout a few
+                    // levels brighter than the console output.
+                    dst[x * 4u + 0u] = static_cast<uint8_t>(r << 3);
+                    dst[x * 4u + 1u] = static_cast<uint8_t>(g << 3);
+                    dst[x * 4u + 2u] = static_cast<uint8_t>(b << 3);
                     dst[x * 4u + 3u] = preserveAlpha ? ((c & 0x8000u) ? 0x80u : 0x00u) : 255u;
                 }
             }
@@ -944,9 +1102,9 @@ bool GS::copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
                 const uint32_t r = pixel & 31u;
                 const uint32_t g = (pixel >> 5) & 31u;
                 const uint32_t b = (pixel >> 10) & 31u;
-                dst[x * 4u + 0u] = static_cast<uint8_t>((r << 3) | (r >> 2));
-                dst[x * 4u + 1u] = static_cast<uint8_t>((g << 3) | (g >> 2));
-                dst[x * 4u + 2u] = static_cast<uint8_t>((b << 3) | (b >> 2));
+                dst[x * 4u + 0u] = static_cast<uint8_t>(r << 3);
+                dst[x * 4u + 1u] = static_cast<uint8_t>(g << 3);
+                dst[x * 4u + 2u] = static_cast<uint8_t>(b << 3);
                 dst[x * 4u + 3u] = preserveAlpha ? ((pixel & 0x8000u) ? 0x80u : 0x00u) : 255u;
             }
         }
@@ -962,24 +1120,42 @@ void GS::latchHostPresentationFrame()
     latchHostPresentationFrameUnlocked();
 }
 
+void GS::applyDisplayEnvironment(uint64_t pmode,
+                                 uint64_t smode2,
+                                 uint64_t dispfb,
+                                 uint64_t display,
+                                 uint64_t bgcolor)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (!m_privRegs)
+    {
+        return;
+    }
+
+    // A display-buffer swap is one logical GS operation. Updating these fields
+    // individually allowed the host presentation thread to latch a mixture of
+    // the old and new environments (for example, DISPFB1 from one buffer and
+    // DISPFB2 from the other), producing a one-frame half-bright blend.
+    m_privRegs->pmode = pmode;
+    m_privRegs->smode2 = smode2;
+    m_privRegs->dispfb1 = dispfb;
+    m_privRegs->display1 = display;
+    m_privRegs->dispfb2 = dispfb;
+    m_privRegs->display2 = display;
+    m_privRegs->bgcolor = bgcolor;
+}
+
 void GS::latchHostPresentationFrameUnlocked()
 {
     if (!m_privRegs || !m_vram || m_vramSize == 0u)
     {
-        m_hostPresentationFrame.clear();
-        m_hostPresentationWidth = 0u;
-        m_hostPresentationHeight = 0u;
-        m_hostPresentationDisplayFbp = 0u;
-        m_hostPresentationSourceFbp = 0u;
-        m_hostPresentationUsedPreferred = false;
-        m_hasHostPresentationFrame = false;
+        // A failed publication attempt must not invalidate the last complete
+        // frame. The host keeps consuming that immutable snapshot until the
+        // guest reaches another real presentation boundary.
         return;
     }
 
     const GSPmodeState pmode = decodePmode(m_privRegs->pmode);
-    const GSSmode2State smode2 = decodeSMode2(m_privRegs->smode2);
-    const bool applyFieldMode = smode2.interlaced && !smode2.frameMode;
-    const bool oddField = (ps2_syscalls::GetCurrentVSyncTick() & 1ull) != 0ull;
     const GSFrameReg displayFrame1 = decodeDisplayFrame(m_privRegs->dispfb1);
     const GSFrameReg displayFrame2 = decodeDisplayFrame(m_privRegs->dispfb2);
     const GSDisplayReadOrigin displayOrigin1 = decodeDisplayReadOrigin(m_privRegs->dispfb1);
@@ -1048,13 +1224,6 @@ void GS::latchHostPresentationFrameUnlocked()
 
     if (!validCrt1 && !validCrt2)
     {
-        m_hostPresentationFrame.clear();
-        m_hostPresentationWidth = 0u;
-        m_hostPresentationHeight = 0u;
-        m_hostPresentationDisplayFbp = 0u;
-        m_hostPresentationSourceFbp = 0u;
-        m_hostPresentationUsedPreferred = false;
-        m_hasHostPresentationFrame = false;
         return;
     }
 
@@ -1124,7 +1293,7 @@ void GS::latchHostPresentationFrameUnlocked()
                     const uint8_t dstA = dstRow[x * 4u + 3u];
                     const uint32_t factor = pmode.mmod
                                                 ? static_cast<uint32_t>(pmode.alp)
-                                                : std::min<uint32_t>(255u, static_cast<uint32_t>(srcA) * 2u);
+                                                : static_cast<uint32_t>(srcA);
 
                     dstRow[x * 4u + 0u] = blendPresentationChannel(srcR, dstR, factor);
                     dstRow[x * 4u + 1u] = blendPresentationChannel(srcG, dstG, factor);
@@ -1142,23 +1311,12 @@ void GS::latchHostPresentationFrameUnlocked()
                 }
             }
 
-            if (applyFieldMode)
-            {
-                applyFieldPresentation(merged, width, height, oddField);
-            }
-
-            m_hostPresentationFrame.swap(merged);
-            m_hostPresentationWidth = width;
-            m_hostPresentationHeight = height;
-            m_hostPresentationDisplayFbp = displayFrame1.fbp;
-            m_hostPresentationSourceFbp = selectedFrame1.fbp;
-            m_hostPresentationUsedPreferred = false;
-            m_hasHostPresentationFrame = true;
-            recordPresentDebugEventUnlocked(m_hostPresentationDisplayFbp,
-                                            m_hostPresentationSourceFbp,
-                                            m_hostPresentationWidth,
-                                            m_hostPresentationHeight,
-                                            m_hostPresentationUsedPreferred);
+            publishHostPresentationFrameUnlocked(std::move(merged),
+                                                  width,
+                                                  height,
+                                                  displayFrame1.fbp,
+                                                  selectedFrame1.fbp,
+                                                  false);
             return;
         }
     }
@@ -1173,35 +1331,55 @@ void GS::latchHostPresentationFrameUnlocked()
     const GSDisplayReadOrigin &displayOrigin = validCrt1 ? displayOrigin1 : displayOrigin2;
     if (!copyDisplaySource(displayFrame, displayOrigin, width, height, true, false, selectedFrame, scratch, usedPreferred))
     {
-        m_hostPresentationFrame.clear();
-        m_hostPresentationWidth = 0u;
-        m_hostPresentationHeight = 0u;
-        m_hostPresentationDisplayFbp = displayFrame.fbp;
-        m_hostPresentationSourceFbp = 0u;
-        m_hostPresentationUsedPreferred = false;
-        m_hasHostPresentationFrame = false;
         return;
     }
 
-    if (applyFieldMode)
-    {
-        applyFieldPresentation(scratch, width, height, oddField);
-    }
-
+    // GS VRAM retains both fields. Present the accumulated framebuffer as a
+    // weave on progressive hosts so alternating scanlines are not discarded.
+    // Motion-adaptive/bob deinterlacing can be offered later as an optional
+    // presentation filter without changing the emulated framebuffer contents.
     normalizePresentationAlpha(scratch, width, height);
 
-    m_hostPresentationFrame.swap(scratch);
-    m_hostPresentationWidth = width;
-    m_hostPresentationHeight = height;
-    m_hostPresentationDisplayFbp = displayFrame.fbp;
-    m_hostPresentationSourceFbp = selectedFrame.fbp;
-    m_hostPresentationUsedPreferred = usedPreferred;
-    m_hasHostPresentationFrame = true;
-    recordPresentDebugEventUnlocked(m_hostPresentationDisplayFbp,
-                                    m_hostPresentationSourceFbp,
-                                    m_hostPresentationWidth,
-                                    m_hostPresentationHeight,
-                                    m_hostPresentationUsedPreferred);
+    publishHostPresentationFrameUnlocked(std::move(scratch),
+                                         width,
+                                         height,
+                                         displayFrame.fbp,
+                                         selectedFrame.fbp,
+                                         usedPreferred);
+}
+
+void GS::publishHostPresentationFrameUnlocked(std::vector<uint8_t> &&pixels,
+                                              uint32_t width,
+                                              uint32_t height,
+                                              uint32_t displayFbp,
+                                              uint32_t sourceFbp,
+                                              bool usedPreferred)
+{
+    if (pixels.empty() || width == 0u || height == 0u)
+    {
+        return;
+    }
+
+    {
+        // Presentation owns a separate immutable snapshot. The host never
+        // reads live VRAM and only holds this short lock while copying a
+        // completed generation, so it cannot delay guest drawing.
+        std::lock_guard<std::mutex> presentationLock(m_hostPresentationMutex);
+        m_hostPresentationFrame = std::move(pixels);
+        m_hostPresentationWidth = width;
+        m_hostPresentationHeight = height;
+        m_hostPresentationDisplayFbp = displayFbp;
+        m_hostPresentationSourceFbp = sourceFbp;
+        m_hostPresentationUsedPreferred = usedPreferred;
+        m_hasHostPresentationFrame = true;
+        ++m_hostPresentationGeneration;
+    }
+
+    recordPresentDebugEventUnlocked(displayFbp,
+                                    sourceFbp,
+                                    width,
+                                    height,
+                                    usedPreferred);
 }
 
 bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
@@ -1209,9 +1387,10 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                                           uint32_t &outHeight,
                                           uint32_t *outDisplayFbp,
                                           uint32_t *outSourceFbp,
-                                          bool *outUsedPreferred) const
+                                          bool *outUsedPreferred,
+                                          uint64_t *outGeneration) const
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    std::lock_guard<std::mutex> presentationLock(m_hostPresentationMutex);
     if (!m_hasHostPresentationFrame || m_hostPresentationFrame.empty())
     {
         outPixels.clear();
@@ -1223,6 +1402,8 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
             *outSourceFbp = 0u;
         if (outUsedPreferred)
             *outUsedPreferred = false;
+        if (outGeneration)
+            *outGeneration = 0u;
         return false;
     }
 
@@ -1234,6 +1415,8 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
         *outSourceFbp = m_hostPresentationSourceFbp;
     if (outUsedPreferred)
         *outUsedPreferred = m_hostPresentationUsedPreferred;
+    if (outGeneration)
+        *outGeneration = m_hostPresentationGeneration;
 
     const size_t packedRowBytes = static_cast<size_t>(outWidth) * 4u;
     outPixels.resize(packedRowBytes * static_cast<size_t>(outHeight));
@@ -1256,6 +1439,8 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                     *outSourceFbp = 0u;
                 if (outUsedPreferred)
                     *outUsedPreferred = false;
+                if (outGeneration)
+                    *outGeneration = 0u;
                 return false;
             }
 
@@ -1265,6 +1450,12 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
         }
     }
     return true;
+}
+
+uint64_t GS::hostPresentationGeneration() const
+{
+    std::lock_guard<std::mutex> presentationLock(m_hostPresentationMutex);
+    return m_hostPresentationGeneration;
 }
 
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
@@ -1706,6 +1897,9 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         regAddr == GS_REG_FRAME_2 ||
         regAddr == GS_REG_ALPHA_1 ||
         regAddr == GS_REG_ALPHA_2 ||
+        regAddr == GS_REG_DIMX ||
+        regAddr == GS_REG_DTHE ||
+        regAddr == GS_REG_COLCLAMP ||
         regAddr == GS_REG_TEST_1 ||
         regAddr == GS_REG_TEST_2 ||
         regAddr == GS_REG_BITBLTBUF ||
@@ -1855,6 +2049,7 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
         t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
         t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
+        updateClut(t);
         break;
     }
     case GS_REG_CLAMP_1:
@@ -1885,6 +2080,7 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
         t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
         t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
+        updateClut(t);
         break;
     }
     case GS_REG_XYOFFSET_1:
@@ -2035,9 +2231,26 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         break;
     case GS_REG_TEXFLUSH:
     case GS_REG_SCANMSK:
+        break;
     case GS_REG_DIMX:
+        for (uint32_t y = 0; y < 4u; ++y)
+        {
+            for (uint32_t x = 0; x < 4u; ++x)
+            {
+                const uint32_t shift = (y * 4u + x) * 4u;
+                const uint8_t encoded = static_cast<uint8_t>((value >> shift) & 0x7u);
+                m_dimx[y][x] = static_cast<int8_t>((encoded & 0x4u) != 0u
+                                                       ? static_cast<int32_t>(encoded) - 8
+                                                       : encoded);
+            }
+        }
+        break;
     case GS_REG_DTHE:
+        m_dthe = (value & 0x1u) != 0u;
+        break;
     case GS_REG_COLCLAMP:
+        m_colclamp = (value & 0x1u) != 0u;
+        break;
     case GS_REG_MIPTBP1_1:
     case GS_REG_MIPTBP1_2:
     case GS_REG_MIPTBP2_1:
@@ -2079,7 +2292,13 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
     case GS_REG_FINISH:
     {
         if (m_privRegs)
+        {
             m_privRegs->csr.fetch_or(0x2);
+            // FINISH is an explicit guest declaration that prior GS work is
+            // complete. It covers games which program privileged registers
+            // directly rather than using the libgraph swap helpers.
+            latchHostPresentationFrameUnlocked();
+        }
         break;
     }
     case GS_REG_LABEL:

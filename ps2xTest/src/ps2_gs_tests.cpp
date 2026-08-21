@@ -6,6 +6,7 @@
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_gs_memory.h"
 #include "runtime/ps2_gs_rasterizer.h"
+#include "runtime/ps2_gs_psmct16.h"
 #include "runtime/ps2_gs_psmct32.h"
 #include "runtime/ps2_gs_psmt4.h"
 #include "runtime/ps2_gs_psmt8.h"
@@ -122,6 +123,11 @@ namespace
         {
             packed = static_cast<uint8_t>((packed & 0xF0u) | (index & 0x0Fu));
         }
+    }
+
+    void writePSMT8Texel(std::vector<uint8_t> &vram, uint32_t tbp, uint32_t tbw, uint32_t x, uint32_t y, uint8_t index)
+    {
+        vram[GSPSMT8::addrPSMT8(tbp, tbw, x, y)] = index;
     }
 
     uint32_t referenceAddrPSMT4(uint32_t block, uint32_t width, uint32_t x, uint32_t y)
@@ -522,6 +528,8 @@ void register_ps2_gs_tests()
                      "sceGsSwapDBuffDc should program GS to the selected display page");
             t.Equals((runtime.memory().gs().display1 >> 32) & 0x0FFFull, 639ull,
                      "sceGsSwapDBuffDc should preserve the display width from the seeded env");
+            t.IsTrue(runtime.gs().hostPresentationGeneration() > 0u,
+                     "sceGsSwapDBuffDc should publish the completed display page before preparing the next draw page");
         });
 
         tc.Run("sceGsSetDefDBuffDc seeds a clear packet and swap clears the draw buffer", [](TestCase &t)
@@ -845,6 +853,126 @@ void register_ps2_gs_tests()
                      "with PABE enabled, high-alpha source pixels should still use the configured ALPHA blend");
         });
 
+        tc.Run("GS dithering applies signed DIMX cells only when enabled for CT16 framebuffers", [](TestCase &t)
+        {
+            struct RenderedPixels
+            {
+                uint16_t positiveCell;
+                uint16_t negativeCell;
+            };
+
+            auto render = [](uint8_t psm, bool dthe) -> RenderedPixels
+            {
+                std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+                GS gs;
+                gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+                constexpr uint64_t kDitherMatrix =
+                    (1ull << 0) | // DIMX[0][0] = +1
+                    (7ull << 4);  // DIMX[0][1] = -1 (signed three-bit encoding)
+                const uint64_t frame =
+                    (1ull << 16) |
+                    (static_cast<uint64_t>(psm) << 24);
+
+                gs.writeRegister(GS_REG_FRAME_1, frame);
+                gs.writeRegister(GS_REG_ZBUF_1, (1ull << 32));
+                gs.writeRegister(GS_REG_SCISSOR_1, (1ull << 16));
+                gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+                gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+                gs.writeRegister(GS_REG_DIMX, kDitherMatrix);
+                gs.writeRegister(GS_REG_DTHE, dthe ? 1ull : 0ull);
+                gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_POINT));
+
+                // +1 takes each 0x07 component across the 5-bit boundary.
+                gs.writeRegister(GS_REG_RGBAQ, 0x80070707ull);
+                gs.writeRegister(GS_REG_XYZ2, 0ull);
+
+                // -1 takes each 0x08 component back across the same boundary.
+                gs.writeRegister(GS_REG_RGBAQ, 0x80080808ull);
+                gs.writeRegister(GS_REG_XYZ2, 16ull);
+
+                const uint32_t positiveOff =
+                    (psm == GS_PSM_CT16)
+                        ? GSPSMCT16::addrPSMCT16(0u, 1u, 0u, 0u)
+                        : GSPSMCT16::addrPSMCT16S(0u, 1u, 0u, 0u);
+                const uint32_t negativeOff =
+                    (psm == GS_PSM_CT16)
+                        ? GSPSMCT16::addrPSMCT16(0u, 1u, 1u, 0u)
+                        : GSPSMCT16::addrPSMCT16S(0u, 1u, 1u, 0u);
+
+                RenderedPixels result{};
+                std::memcpy(&result.positiveCell, vram.data() + positiveOff, sizeof(result.positiveCell));
+                std::memcpy(&result.negativeCell, vram.data() + negativeOff, sizeof(result.negativeCell));
+                return result;
+            };
+
+            constexpr uint16_t kAlphaOnly = 0x8000u;
+            constexpr uint16_t kOneRgbStep = 0x8421u;
+            for (const uint8_t psm : {static_cast<uint8_t>(GS_PSM_CT16), static_cast<uint8_t>(GS_PSM_CT16S)})
+            {
+                const RenderedPixels disabled = render(psm, false);
+                t.Equals(disabled.positiveCell, kAlphaOnly,
+                         "DTHE=0 should convert 0x07 components by truncation without applying a positive DIMX cell");
+                t.Equals(disabled.negativeCell, kOneRgbStep,
+                         "DTHE=0 should convert 0x08 components by truncation without applying a negative DIMX cell");
+
+                const RenderedPixels enabled = render(psm, true);
+                t.Equals(enabled.positiveCell, kOneRgbStep,
+                         "DTHE=1 should add a positive DIMX cell before CT16/CT16S format conversion");
+                t.Equals(enabled.negativeCell, kAlphaOnly,
+                         "DTHE=1 should sign-extend and add a negative DIMX cell before CT16/CT16S format conversion");
+            }
+        });
+
+        tc.Run("GS COLCLAMP clamps or wraps wide alpha-blend results before framebuffer storage", [](TestCase &t)
+        {
+            auto render = [](bool colclamp, bool negativeResult) -> uint32_t
+            {
+                std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+                GS gs;
+                gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+                // Positive: (Cs - 0) * FIX / 128 + Cs = 400 for Cs=200.
+                // Negative: (0 - Cs) * FIX / 128 + 0 = -1 for Cs=1.
+                constexpr uint64_t kPositiveAlpha =
+                    (2ull << 2) |
+                    (2ull << 4) |
+                    (0x80ull << 32);
+                constexpr uint64_t kNegativeAlpha =
+                    (2ull << 0) |
+                    (0ull << 2) |
+                    (2ull << 4) |
+                    (2ull << 6) |
+                    (0x80ull << 32);
+
+                gs.writeRegister(GS_REG_FRAME_1, (1ull << 16));
+                gs.writeRegister(GS_REG_ZBUF_1, (1ull << 32));
+                gs.writeRegister(GS_REG_SCISSOR_1, 0ull);
+                gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+                gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+                gs.writeRegister(GS_REG_COLCLAMP, colclamp ? 1ull : 0ull);
+                gs.writeRegister(GS_REG_ALPHA_1, negativeResult ? kNegativeAlpha : kPositiveAlpha);
+                gs.writeRegister(GS_REG_PRIM,
+                                 static_cast<uint64_t>(GS_PRIM_POINT) |
+                                     (1ull << 6));
+                gs.writeRegister(GS_REG_RGBAQ, negativeResult ? 0x80010101ull : 0x80C8C8C8ull);
+                gs.writeRegister(GS_REG_XYZ2, 0ull);
+
+                uint32_t pixel = 0u;
+                std::memcpy(&pixel, vram.data(), sizeof(pixel));
+                return pixel;
+            };
+
+            t.Equals(render(true, false), 0x80FFFFFFu,
+                     "COLCLAMP=1 should saturate an alpha-blend result above 255");
+            t.Equals(render(false, false), 0x80909090u,
+                     "COLCLAMP=0 should retain the low eight bits of an alpha-blend result above 255");
+            t.Equals(render(true, true), 0x80000000u,
+                     "COLCLAMP=1 should saturate a negative alpha-blend result to zero");
+            t.Equals(render(false, true), 0x80FFFFFFu,
+                     "COLCLAMP=0 should retain the low eight bits of a negative alpha-blend result");
+        });
+
         tc.Run("FBA forces the framebuffer alpha high bit on CT32 writes", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
@@ -943,7 +1071,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_UV, kUvRow1);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
             gs.writeRegister(GS_REG_UV, kUvRow1);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, (16ull << 0) | (16ull << 16));
 
             const uint32_t dstPixel = readReferenceFramePSMCT32Pixel(vram, 150u, 1u, 0u, 0u);
             t.Equals(dstPixel, static_cast<uint32_t>(kSourceColor),
@@ -1025,6 +1153,404 @@ void register_ps2_gs_tests()
                              "1:1 FST sprite copies should preserve each source texel without off-by-one edge skew");
                 }
             }
+        });
+
+        tc.Run("FST sprite bilinear sampling preserves 12.4 UV fractions", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            constexpr uint32_t kTexTbp = 64u;
+            constexpr uint32_t kBlack = 0x80000000u;
+            constexpr uint32_t kWhite = 0x80FFFFFFu;
+            constexpr uint64_t kFrame =
+                (1ull << 16) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 24);
+            constexpr uint64_t kTex0 =
+                (static_cast<uint64_t>(kTexTbp) << 0) |
+                (1ull << 14) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 20) |
+                (1ull << 26) | // 2 texels wide
+                (1ull << 34) |
+                (1ull << 35);  // DECAL
+            constexpr uint64_t kLinearTex1 =
+                (1ull << 5) | // MMAG = LINEAR
+                (1ull << 6);  // MMIN = LINEAR
+            constexpr uint64_t kPrim =
+                static_cast<uint64_t>(GS_PRIM_SPRITE) |
+                (1ull << 4) |
+                (1ull << 8);
+            constexpr uint64_t kClampUv = 1ull | (1ull << 2);
+            constexpr uint64_t kFractionalUv = 12ull; // U=0.75, V=0 in 12.4 fixed point.
+
+            writeReferencePSMCT32Pixel(vram, kTexTbp, 1u, 0u, 0u, kBlack);
+            writeReferencePSMCT32Pixel(vram, kTexTbp, 1u, 1u, 0u, kWhite);
+
+            gs.writeRegister(GS_REG_FRAME_1, kFrame);
+            gs.writeRegister(GS_REG_ZBUF_1, (1ull << 32));
+            gs.writeRegister(GS_REG_SCISSOR_1, 0ull);
+            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(GS_REG_TEX0_1, kTex0);
+            gs.writeRegister(GS_REG_TEX1_1, kLinearTex1);
+            gs.writeRegister(GS_REG_CLAMP_1, kClampUv);
+            gs.writeRegister(GS_REG_PRIM, kPrim);
+            gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
+            gs.writeRegister(GS_REG_UV, kFractionalUv);
+            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_UV, kFractionalUv);
+            gs.writeRegister(GS_REG_XYZ2, (16ull << 0) | (16ull << 16));
+
+            const uint32_t pixel = readReferencePSMCT32Pixel(vram, 0u, 1u, 0u, 0u);
+            t.Equals(pixel, 0x80404040u,
+                     "U=0.75 should retain its fractional nibble and blend 25% toward texel 1; truncating UV before interpolation produces black");
+        });
+
+        tc.Run("sprite coverage uses GS integer pixel coordinates with fractional XYOFFSET", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            constexpr uint64_t kFrame =
+                (1ull << 16) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 24);
+            constexpr uint64_t kScissor = (1ull << 16);
+            constexpr uint64_t kFractionalOffset = 12ull; // OFX=0.75 in 12.4 fixed point.
+            constexpr uint32_t kColor = 0x80402010u;
+
+            gs.writeRegister(GS_REG_FRAME_1, kFrame);
+            gs.writeRegister(GS_REG_ZBUF_1, (1ull << 32));
+            gs.writeRegister(GS_REG_SCISSOR_1, kScissor);
+            gs.writeRegister(GS_REG_XYOFFSET_1, kFractionalOffset);
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE));
+            gs.writeRegister(GS_REG_RGBAQ, kColor);
+
+            // The GS evaluates sprite coverage at integer pixel coordinates:
+            // ceil([0.25, 1.25)) covers pixel 1. Dropping OFX's fractional
+            // nibble instead produces [1, 2), which coincidentally has the
+            // same coverage; the filtered tests below verify interpolation.
+            gs.writeRegister(GS_REG_XYZ2, 16ull);
+            gs.writeRegister(GS_REG_XYZ2, (32ull << 0) | (16ull << 16));
+
+            t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, 0u, 0u), 0u,
+                     "a sprite beginning at X=0.25 should not cover GS pixel coordinate 0");
+            t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, 1u, 0u), kColor,
+                     "ceil-based GS sprite coverage should include pixel coordinate 1");
+        });
+
+        tc.Run("FST point-filtered sprites prestep UV from ceil-rounded GS pixels", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            constexpr uint32_t kTexTbp = 64u;
+            constexpr uint32_t kRed = 0x800000FFu;
+            constexpr uint32_t kGreen = 0x8000FF00u;
+            constexpr uint32_t kBlue = 0x80FF0000u;
+            constexpr uint64_t kFrame =
+                (1ull << 16) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 24);
+            constexpr uint64_t kTex0 =
+                (static_cast<uint64_t>(kTexTbp) << 0) |
+                (1ull << 14) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 20) |
+                (2ull << 26) | // Four texels wide.
+                (1ull << 34) |
+                (1ull << 35);  // DECAL
+            constexpr uint64_t kPrim =
+                static_cast<uint64_t>(GS_PRIM_SPRITE) |
+                (1ull << 4) |
+                (1ull << 8);
+            constexpr uint64_t kClampUv = 1ull | (1ull << 2);
+            constexpr uint64_t kFractionalOffset = 12ull; // OFX=0.75.
+
+            writeReferencePSMCT32Pixel(vram, kTexTbp, 1u, 0u, 0u, kRed);
+            writeReferencePSMCT32Pixel(vram, kTexTbp, 1u, 1u, 0u, kGreen);
+            writeReferencePSMCT32Pixel(vram, kTexTbp, 1u, 2u, 0u, kBlue);
+
+            gs.writeRegister(GS_REG_FRAME_1, kFrame);
+            gs.writeRegister(GS_REG_ZBUF_1, (1ull << 32));
+            gs.writeRegister(GS_REG_SCISSOR_1, (2ull << 16));
+            gs.writeRegister(GS_REG_XYOFFSET_1, kFractionalOffset);
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(GS_REG_TEX0_1, kTex0);
+            gs.writeRegister(GS_REG_TEX1_1, 0ull);
+            gs.writeRegister(GS_REG_CLAMP_1, kClampUv);
+            gs.writeRegister(GS_REG_PRIM, kPrim);
+            gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
+
+            // Screen X is [0.25, 2.25), so the GS draws X=1 and X=2.
+            // Prestepping UV from X=0.25 gives U=0.75 and U=1.75;
+            // point sampling truncates these to texels 0 and 1.
+            gs.writeRegister(GS_REG_UV, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, 16ull);
+            gs.writeRegister(GS_REG_UV, 32ull);
+            gs.writeRegister(GS_REG_XYZ2, (48ull << 0) | (16ull << 16));
+
+            t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, 0u, 0u), 0u,
+                     "ceil-based sprite coverage should leave X=0 untouched");
+            t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, 1u, 0u), kRed,
+                     "point sampling should truncate the prestepped U=0.75 to texel 0");
+            t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, 2u, 0u), kGreen,
+                     "point sampling should truncate the prestepped U=1.75 to texel 1");
+        });
+
+        tc.Run("FST bilinear sprites combine fractional XYOFFSET and UV prestep at GS pixel coordinates", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            constexpr uint32_t kTexTbp = 64u;
+            constexpr uint32_t kBlack = 0x80000000u;
+            constexpr uint32_t kWhite = 0x80FFFFFFu;
+            constexpr uint64_t kFrame =
+                (1ull << 16) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 24);
+            constexpr uint64_t kTex0 =
+                (static_cast<uint64_t>(kTexTbp) << 0) |
+                (1ull << 14) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 20) |
+                (1ull << 26) | // Two texels wide.
+                (1ull << 34) |
+                (1ull << 35);  // DECAL
+            constexpr uint64_t kLinearTex1 =
+                (1ull << 5) |
+                (1ull << 6);
+            constexpr uint64_t kPrim =
+                static_cast<uint64_t>(GS_PRIM_SPRITE) |
+                (1ull << 4) |
+                (1ull << 8);
+            constexpr uint64_t kClampUv = 1ull | (1ull << 2);
+            constexpr uint64_t kFractionalOffset = 12ull; // OFX=0.75.
+            constexpr uint64_t kUv0 = 8ull | (8ull << 16);   // (0.5, 0.5)
+            constexpr uint64_t kUv1 = 24ull | (8ull << 16);  // (1.5, 0.5)
+
+            writeReferencePSMCT32Pixel(vram, kTexTbp, 1u, 0u, 0u, kBlack);
+            writeReferencePSMCT32Pixel(vram, kTexTbp, 1u, 1u, 0u, kWhite);
+
+            gs.writeRegister(GS_REG_FRAME_1, kFrame);
+            gs.writeRegister(GS_REG_ZBUF_1, (1ull << 32));
+            gs.writeRegister(GS_REG_SCISSOR_1, (1ull << 16));
+            gs.writeRegister(GS_REG_XYOFFSET_1, kFractionalOffset);
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(GS_REG_TEX0_1, kTex0);
+            gs.writeRegister(GS_REG_TEX1_1, kLinearTex1);
+            gs.writeRegister(GS_REG_CLAMP_1, kClampUv);
+            gs.writeRegister(GS_REG_PRIM, kPrim);
+            gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
+
+            // Screen X is [0.25, 1.25), so only X=1 is drawn. Its 0.75
+            // prestep advances U from 0.5 to 1.25. Bilinear filtering then
+            // subtracts the texel-center bias and blends 75% toward white.
+            gs.writeRegister(GS_REG_UV, kUv0);
+            gs.writeRegister(GS_REG_XYZ2, 16ull);
+            gs.writeRegister(GS_REG_UV, kUv1);
+            gs.writeRegister(GS_REG_XYZ2, (32ull << 0) | (16ull << 16));
+
+            t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, 0u, 0u), 0u,
+                     "integer-coordinate GS coverage should leave X=0 untouched");
+            t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, 1u, 0u), 0x80BFBFBFu,
+                     "U=1.25 should bilinearly blend black and white with a 12/16 white weight");
+        });
+
+        tc.Run("triangle coverage evaluates GS integer pixel coordinates", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            constexpr uint32_t kColor = 0x80402010u;
+            constexpr uint64_t kFrame =
+                (1ull << 16) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 24);
+            constexpr uint64_t kScissor =
+                (2ull << 16) |
+                (2ull << 48);
+
+            gs.writeRegister(GS_REG_FRAME_1, kFrame);
+            gs.writeRegister(GS_REG_ZBUF_1, (1ull << 32));
+            gs.writeRegister(GS_REG_SCISSOR_1, kScissor);
+            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_TRIANGLE));
+            gs.writeRegister(GS_REG_RGBAQ, kColor);
+
+            // Screen vertices are (0.25, 0.25), (2.25, 0.25), and
+            // (0.25, 2.25). The GS evaluates the triangle at integer pixel
+            // coordinates, so (1,1) is inside while row/column zero are not.
+            gs.writeRegister(GS_REG_XYZ2, 4ull | (4ull << 16));
+            gs.writeRegister(GS_REG_XYZ2, 36ull | (4ull << 16));
+            gs.writeRegister(GS_REG_XYZ2, 4ull | (36ull << 16));
+
+            t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, 0u, 0u), 0u,
+                     "GS triangle coverage must not shift pixel coordinate (0,0) to host-style center (0.5,0.5)");
+            t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, 1u, 0u), 0u,
+                     "integer-coordinate coverage should exclude the row above the triangle's first scanline");
+            t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, 0u, 1u), 0u,
+                     "integer-coordinate coverage should exclude the column before the triangle's left edge");
+            t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, 1u, 1u), kColor,
+                     "the first GS integer pixel strictly inside the triangle should be rasterized");
+        });
+
+        tc.Run("triangle XYOFFSET retains 12.4 fractions before rasterization", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            constexpr uint32_t kColor = 0x80402010u;
+            constexpr uint64_t kFrame =
+                (1ull << 16) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 24);
+            constexpr uint64_t kScissor =
+                (3ull << 16) |
+                (3ull << 48);
+            constexpr uint64_t kFractionalOffset =
+                12ull |
+                (12ull << 32); // OFX=OFY=0.75 in 12.4 fixed point.
+
+            gs.writeRegister(GS_REG_FRAME_1, kFrame);
+            gs.writeRegister(GS_REG_ZBUF_1, (1ull << 32));
+            gs.writeRegister(GS_REG_SCISSOR_1, kScissor);
+            gs.writeRegister(GS_REG_XYOFFSET_1, kFractionalOffset);
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_TRIANGLE));
+            gs.writeRegister(GS_REG_RGBAQ, kColor);
+
+            // Raw vertices (1.75,1.75), (3.75,1.75), (1.75,3.75)
+            // become the integer-aligned triangle (1,1), (3,1), (1,3).
+            // Truncating XYOFFSET instead shifts coverage down and right.
+            gs.writeRegister(GS_REG_XYZ2, 28ull | (28ull << 16));
+            gs.writeRegister(GS_REG_XYZ2, 60ull | (28ull << 16));
+            gs.writeRegister(GS_REG_XYZ2, 28ull | (60ull << 16));
+
+            t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, 1u, 1u), kColor,
+                     "subtracting the complete 12.4 XYOFFSET should place the top-left triangle pixel at (1,1)");
+            t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, 2u, 2u), 0u,
+                     "the bottom-right edge should remain exclusive after applying fractional XYOFFSET");
+        });
+
+        tc.Run("adjacent triangles apply the GS top-left rule once on shared edges", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            constexpr uint64_t kFrame =
+                (1ull << 16) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 24);
+            constexpr uint64_t kScissor =
+                (1ull << 16) |
+                (1ull << 48);
+            constexpr uint64_t kAddHalfSource =
+                (2ull << 2) |  // B = zero
+                (2ull << 4) |  // C = FIX
+                (1ull << 6) |  // D = destination
+                (0x40ull << 32);
+            constexpr uint32_t kOnePass = 0x80202020u;
+
+            auto xyz = [](uint32_t x, uint32_t y) -> uint64_t
+            {
+                return static_cast<uint64_t>(x * 16u) |
+                       (static_cast<uint64_t>(y * 16u) << 16);
+            };
+
+            gs.writeRegister(GS_REG_FRAME_1, kFrame);
+            gs.writeRegister(GS_REG_ZBUF_1, (1ull << 32));
+            gs.writeRegister(GS_REG_SCISSOR_1, kScissor);
+            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(GS_REG_ALPHA_1, kAddHalfSource);
+            gs.writeRegister(GS_REG_PRIM,
+                             static_cast<uint64_t>(GS_PRIM_TRIANGLE) |
+                                 (1ull << 6));
+            gs.writeRegister(GS_REG_RGBAQ, 0x80404040ull);
+
+            // Two triangles form a 2x2 rectangle and share the descending
+            // diagonal. The half-open top-left rule assigns every pixel to
+            // exactly one primitive; an inclusive edge test blends the two
+            // diagonal pixels twice.
+            gs.writeRegister(GS_REG_XYZ2, xyz(0u, 0u));
+            gs.writeRegister(GS_REG_XYZ2, xyz(2u, 0u));
+            gs.writeRegister(GS_REG_XYZ2, xyz(0u, 2u));
+
+            gs.writeRegister(GS_REG_XYZ2, xyz(2u, 0u));
+            gs.writeRegister(GS_REG_XYZ2, xyz(2u, 2u));
+            gs.writeRegister(GS_REG_XYZ2, xyz(0u, 2u));
+
+            for (uint32_t y = 0u; y < 2u; ++y)
+            {
+                for (uint32_t x = 0u; x < 2u; ++x)
+                {
+                    t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, x, y), kOnePass,
+                             "a rectangle split into adjacent triangles should shade each GS pixel exactly once");
+                }
+            }
+        });
+
+        tc.Run("FST triangle interpolation prestep starts at GS integer pixel coordinates", [](TestCase &t)
+        {
+            auto render = [](bool linearFilter) -> uint32_t
+            {
+                std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+                GS gs;
+                gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+                constexpr uint32_t kTexTbp = 64u;
+                constexpr uint32_t kBlack = 0x80000000u;
+                constexpr uint32_t kWhite = 0x80FFFFFFu;
+                constexpr uint64_t kFrame =
+                    (1ull << 16) |
+                    (static_cast<uint64_t>(GS_PSM_CT32) << 24);
+                constexpr uint64_t kTex0 =
+                    (static_cast<uint64_t>(kTexTbp) << 0) |
+                    (1ull << 14) |
+                    (static_cast<uint64_t>(GS_PSM_CT32) << 20) |
+                    (2ull << 26) | // Four texels wide.
+                    (1ull << 34) |
+                    (1ull << 35);  // DECAL
+                constexpr uint64_t kPrim =
+                    static_cast<uint64_t>(GS_PRIM_TRIANGLE) |
+                    (1ull << 4) |
+                    (1ull << 8);
+
+                writeReferencePSMCT32Pixel(vram, kTexTbp, 1u, 0u, 0u, kBlack);
+                writeReferencePSMCT32Pixel(vram, kTexTbp, 1u, 1u, 0u, kWhite);
+                writeReferencePSMCT32Pixel(vram, kTexTbp, 1u, 2u, 0u, kWhite);
+
+                gs.writeRegister(GS_REG_FRAME_1, kFrame);
+                gs.writeRegister(GS_REG_ZBUF_1, (1ull << 32));
+                gs.writeRegister(GS_REG_SCISSOR_1, (4ull << 16) | (4ull << 48));
+                gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+                gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+                gs.writeRegister(GS_REG_TEX0_1, kTex0);
+                gs.writeRegister(GS_REG_TEX1_1, linearFilter ? ((1ull << 5) | (1ull << 6)) : 0ull);
+                gs.writeRegister(GS_REG_CLAMP_1, 1ull | (1ull << 2));
+                gs.writeRegister(GS_REG_PRIM, kPrim);
+                gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
+
+                // Across X=[0.25,4.25], U rises from 0 to 4. At GS pixel
+                // coordinate X=1 the DDA prestep produces U=0.75. Sampling
+                // at host center X=1.5 instead produces U=1.25.
+                gs.writeRegister(GS_REG_UV, 0ull);
+                gs.writeRegister(GS_REG_XYZ2, 4ull | (4ull << 16));
+                gs.writeRegister(GS_REG_UV, 64ull);
+                gs.writeRegister(GS_REG_XYZ2, 68ull | (4ull << 16));
+                gs.writeRegister(GS_REG_UV, 0ull);
+                gs.writeRegister(GS_REG_XYZ2, 4ull | (68ull << 16));
+
+                return readReferencePSMCT32Pixel(vram, 0u, 1u, 1u, 1u);
+            };
+
+            t.Equals(render(false), 0x80000000u,
+                     "point sampling should truncate the integer-coordinate DDA result U=0.75 to texel 0");
+            t.Equals(render(true), 0x80404040u,
+                     "bilinear sampling should retain U=0.75 and blend 4/16 toward texel 1");
         });
 
         tc.Run("fullscreen display copy tracks the preferred presentation source frame", [](TestCase &t)
@@ -1189,6 +1715,9 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_XYZ2, kXyz1);
 
             gs.latchHostPresentationFrame();
+            const uint64_t firstGeneration = gs.hostPresentationGeneration();
+            t.IsTrue(firstGeneration > 0u,
+                     "a successful latch should publish a nonzero frame generation");
 
             std::vector<uint8_t> latchedFrame;
             uint32_t latchedWidth = 0u;
@@ -1231,8 +1760,12 @@ void register_ps2_gs_tests()
                      "latched host presentation should remain readable without relatching");
             t.Equals(static_cast<uint32_t>(staleFrame[0]), 0x44u,
                      "latched host presentation should stay stable until the next latch");
+            t.Equals(gs.hostPresentationGeneration(), firstGeneration,
+                     "live VRAM writes must not publish a partial host frame");
 
             gs.latchHostPresentationFrame();
+            t.Equals(gs.hostPresentationGeneration(), firstGeneration + 1u,
+                     "the next completed latch should advance the published generation exactly once");
 
             std::vector<uint8_t> refreshedFrame;
             uint32_t refreshedWidth = 0u;
@@ -1469,6 +2002,57 @@ void register_ps2_gs_tests()
                      "direct CT32 presentation should normalize row 1 alpha for the host frame");
         });
 
+        tc.Run("latched host presentation expands CT16 display channels into bits 7 through 3", [](TestCase &t)
+        {
+            for (const uint8_t framePsm : {static_cast<uint8_t>(GS_PSM_CT16),
+                                           static_cast<uint8_t>(GS_PSM_CT16S)})
+            {
+                std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+                GSRegisters regs{};
+                regs.pmode = 0x0001ull;
+                regs.dispfb1 =
+                    150ull |
+                    (10ull << 9) |
+                    (static_cast<uint64_t>(framePsm) << 15);
+                regs.display1 =
+                    (639ull << 32) |
+                    (447ull << 44);
+
+                GS gs;
+                gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
+
+                constexpr uint16_t kPixel =
+                    31u |
+                    (17u << 5) |
+                    (7u << 10) |
+                    0x8000u;
+                const uint32_t pixelOffset = (framePsm == GS_PSM_CT16)
+                    ? GSPSMCT16::addrPSMCT16(frameBaseToBlock(150u), 10u, 0u, 1u)
+                    : GSPSMCT16::addrPSMCT16S(frameBaseToBlock(150u), 10u, 0u, 1u);
+                std::memcpy(vram.data() + pixelOffset, &kPixel, sizeof(kPixel));
+
+                gs.latchHostPresentationFrame();
+
+                std::vector<uint8_t> latchedFrame;
+                uint32_t latchedWidth = 0u;
+                uint32_t latchedHeight = 0u;
+                t.IsTrue(gs.copyLatchedHostPresentationFrame(latchedFrame,
+                                                             latchedWidth,
+                                                             latchedHeight),
+                         "direct CT16 presentation should produce a host frame");
+
+                constexpr size_t kHostRow1Off = 640u * 4u;
+                t.Equals(static_cast<uint32_t>(latchedFrame[kHostRow1Off + 0u]), 0xF8u,
+                         "CT16 red should occupy host bits 7 through 3 without bit replication");
+                t.Equals(static_cast<uint32_t>(latchedFrame[kHostRow1Off + 1u]), 0x88u,
+                         "CT16 green should occupy host bits 7 through 3 without bit replication");
+                t.Equals(static_cast<uint32_t>(latchedFrame[kHostRow1Off + 2u]), 0x38u,
+                         "CT16 blue should occupy host bits 7 through 3 without bit replication");
+                t.Equals(static_cast<uint32_t>(latchedFrame[kHostRow1Off + 3u]), 0xFFu,
+                         "CT16 host presentation should normalize framebuffer alpha");
+            }
+        });
+
         tc.Run("latched host presentation honors a black display page instead of a colored draw context", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
@@ -1523,6 +2107,40 @@ void register_ps2_gs_tests()
                      "black display blue should remain black");
             t.Equals(static_cast<uint32_t>(latchedFrame[3]), 0xFFu,
                      "black display alpha should be normalized for host presentation");
+        });
+
+        tc.Run("display environment swaps update both presentation circuits together", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GSRegisters regs{};
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
+
+            constexpr uint64_t kPmode = 0x7F23ull;
+            constexpr uint64_t kSmode2 = 0x1ull;
+            constexpr uint64_t kDispfb = 0x51446ull;
+            constexpr uint64_t kDisplay = 0x1BF9FF0183327Cull;
+            constexpr uint64_t kBgcolor = 0x00332211ull;
+            gs.applyDisplayEnvironment(kPmode,
+                                       kSmode2,
+                                       kDispfb,
+                                       kDisplay,
+                                       kBgcolor);
+
+            t.Equals(regs.pmode, kPmode,
+                     "display environment should update PMODE");
+            t.Equals(regs.smode2, kSmode2,
+                     "display environment should update SMODE2");
+            t.Equals(regs.dispfb1, kDispfb,
+                     "display environment should update DISPFB1");
+            t.Equals(regs.dispfb2, kDispfb,
+                     "display environment should update DISPFB2 to the same page");
+            t.Equals(regs.display1, kDisplay,
+                     "display environment should update DISPLAY1");
+            t.Equals(regs.display2, kDisplay,
+                     "display environment should update DISPLAY2 to the same geometry");
+            t.Equals(regs.bgcolor, kBgcolor,
+                     "display environment should update BGCOLOR");
         });
 
         tc.Run("latched host presentation merges both enabled PMODE circuits", [](TestCase &t)
@@ -1590,6 +2208,56 @@ void register_ps2_gs_tests()
                      "dual-circuit presentation should blend the second circuit blue channel under the first circuit");
             t.Equals(static_cast<uint32_t>(latchedFrame[3]), 0xFFu,
                      "dual-circuit presentation should normalize the final host alpha");
+        });
+
+        tc.Run("PMODE fixed alpha uses the GS 0x80 unity scale", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GSRegisters regs{};
+            // EN1 | EN2 | MMOD | AMOD, with the deck screen's 0x7f
+            // flicker-filter alpha.  On the GS, 0x80 is 1.0, so 0x7f must
+            // retain 127/128 of RC1 rather than only 127/255.
+            regs.pmode = 0x7f63ull;
+            regs.dispfb1 =
+                150ull |
+                (10ull << 9) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 15);
+            regs.display1 =
+                (639ull << 32) |
+                (447ull << 44);
+            regs.dispfb2 =
+                0ull |
+                (10ull << 9) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 15);
+            regs.display2 = regs.display1;
+
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
+
+            constexpr uint32_t kCircuit1Pixel =
+                128u |
+                (64u << 8) |
+                (32u << 16) |
+                (0x80u << 24);
+            constexpr uint32_t kCircuit2Pixel = 0u;
+            writeReferenceFramePSMCT32Pixel(vram, 150u, 10u, 0u, 0u, kCircuit1Pixel);
+            std::memcpy(vram.data(), &kCircuit2Pixel, sizeof(kCircuit2Pixel));
+
+            gs.latchHostPresentationFrame();
+
+            std::vector<uint8_t> latchedFrame;
+            uint32_t latchedWidth = 0u;
+            uint32_t latchedHeight = 0u;
+            t.IsTrue(gs.copyLatchedHostPresentationFrame(latchedFrame, latchedWidth, latchedHeight),
+                     "fixed-alpha dual-circuit presentation should produce a host frame");
+            t.Equals(static_cast<uint32_t>(latchedFrame[0]), 127u,
+                     "PMODE ALP 0x7f should preserve 127/128 of RC1 red");
+            t.Equals(static_cast<uint32_t>(latchedFrame[1]), 63u,
+                     "PMODE ALP 0x7f should preserve 127/128 of RC1 green");
+            t.Equals(static_cast<uint32_t>(latchedFrame[2]), 31u,
+                     "PMODE ALP 0x7f should preserve 127/128 of RC1 blue");
+            t.Equals(static_cast<uint32_t>(latchedFrame[3]), 0xFFu,
+                     "fixed-alpha presentation should normalize host alpha");
         });
 
         tc.Run("latched host presentation normalizes alpha for single-circuit display", [](TestCase &t)
@@ -1678,7 +2346,7 @@ void register_ps2_gs_tests()
                      "single-circuit presentation should normalize the last row alpha");
         });
 
-        tc.Run("latched host presentation line-doubles a stable interlaced field", [](TestCase &t)
+        tc.Run("latched host presentation weaves accumulated interlaced fields", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GSRegisters regs{};
@@ -1729,12 +2397,14 @@ void register_ps2_gs_tests()
             const uint32_t row2 = pixelAtRow(2u);
             const uint32_t row3 = pixelAtRow(3u);
 
-            t.Equals(row0, row1,
-                     "field presentation should duplicate the active field into the next scanline");
-            t.Equals(row2, row3,
-                     "field presentation should duplicate later field scanlines as well");
-            t.IsTrue(row0 != row2,
-                     "field presentation should still preserve different source content across field rows");
+            t.Equals(row0, kLine0,
+                     "weave presentation should preserve the first even-field scanline");
+            t.Equals(row1, kLine1,
+                     "weave presentation should preserve the first odd-field scanline");
+            t.Equals(row2, kLine2,
+                     "weave presentation should preserve the next even-field scanline");
+            t.Equals(row3, kLine3,
+                     "weave presentation should preserve the next odd-field scanline");
         });
 
         tc.Run("GIF PACKED A+D writes DISPFB1 and DISPLAY1 privileged registers", [](TestCase &t)
@@ -1886,7 +2556,8 @@ void register_ps2_gs_tests()
                 (1ull << 35) |
                 (static_cast<uint64_t>(kClutCbp) << 37) |
                 (static_cast<uint64_t>(GS_PSM_CT32) << 51) |
-                (1ull << 55);
+                (1ull << 55) |
+                (1ull << 61);
             constexpr uint64_t kPrim =
                 static_cast<uint64_t>(GS_PRIM_TRIANGLE) |
                 (1ull << 4);
@@ -2613,7 +3284,8 @@ void register_ps2_gs_tests()
                 (1ull << 34) |
                 (1ull << 35) |
                 (static_cast<uint64_t>(kClutCbp) << 37) |
-                (static_cast<uint64_t>(GS_PSM_CT32) << 51);
+                (static_cast<uint64_t>(GS_PSM_CT32) << 51) |
+                (1ull << 61);
             constexpr uint64_t kPrim =
                 static_cast<uint64_t>(GS_PRIM_SPRITE) |
                 (1ull << 4) |  // TME
@@ -2644,7 +3316,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
             gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, (16ull << 0) | (16ull << 16));
 
             uint32_t pixel = 0u;
             std::memcpy(&pixel, vram.data(), sizeof(pixel));
@@ -2674,7 +3346,8 @@ void register_ps2_gs_tests()
                 (1ull << 34) |
                 (1ull << 35) |
                 (static_cast<uint64_t>(kClutCbp) << 37) |
-                (static_cast<uint64_t>(GS_PSM_CT32) << 51);
+                (static_cast<uint64_t>(GS_PSM_CT32) << 51) |
+                (1ull << 61);
             constexpr uint64_t kPrim =
                 static_cast<uint64_t>(GS_PRIM_SPRITE) |
                 (1ull << 4) |  // TME
@@ -2726,7 +3399,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
             gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, (16ull << 0) | (16ull << 16));
 
             uint32_t pixel = 0u;
             std::memcpy(&pixel, vram.data(), sizeof(pixel));
@@ -2757,22 +3430,25 @@ void register_ps2_gs_tests()
                 (1ull << 35) |
                 (static_cast<uint64_t>(kClutCbp) << 37) |
                 (static_cast<uint64_t>(GS_PSM_CT32) << 51) |
-                (17ull << 56);
+                (17ull << 56) |
+                (1ull << 61);
             constexpr uint64_t kPrim =
                 static_cast<uint64_t>(GS_PRIM_SPRITE) |
                 (1ull << 4) |
                 (1ull << 8);
             constexpr uint32_t kExpectedColor = 0xFF204080u;
-            constexpr uint32_t kWrongNoCsaColor = 0xFF00FF00u;
+            constexpr uint32_t kWrongLiveVramOffsetColor = 0xFF00FF00u;
             constexpr uint32_t kWrongBit4Color = 0xFFFF0000u;
 
             const uint32_t texOff = GSPSMT8::addrPSMT8(kTexTbp, 1u, 0u, 0u);
             vram[texOff] = 0u;
 
-            // CSA=17 is CSA=1 for a CT32 CLUT. Logical entry 16 is at
-            // physical CSM1 entry 8 after address bits 3 and 4 are swapped.
-            gs.WriteVram(GS_PSM_CT32, kClutCbp, 1u, 0u, 0u, kWrongNoCsaColor);
-            gs.WriteVram(GS_PSM_CT32, kClutCbp, 1u, 8u, 0u, kExpectedColor);
+            // CLD snapshots the palette from the CSM1 source origin into the
+            // temporary CLUT region selected by CSA. Sampling then applies
+            // CSA to that temporary buffer; it must not offset the VRAM read.
+            // CT32 masks CSA bit 4, so CSA=17 aliases CSA=1.
+            gs.WriteVram(GS_PSM_CT32, kClutCbp, 1u, 0u, 0u, kExpectedColor);
+            gs.WriteVram(GS_PSM_CT32, kClutCbp, 1u, 8u, 0u, kWrongLiveVramOffsetColor);
             gs.WriteVram(GS_PSM_CT32, kClutCbp, 1u, 8u, 16u, kWrongBit4Color);
 
             gs.writeRegister(GS_REG_FRAME_1, kFrameReg);
@@ -2787,12 +3463,12 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
             gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, (16ull << 0) | (16ull << 16));
 
             uint32_t pixel = 0u;
             std::memcpy(&pixel, vram.data(), sizeof(pixel));
             t.Equals(pixel, kExpectedColor,
-                     "T8 CSM1 should offset by CSA while CT32 ignores the fifth CSA bit");
+                     "T8 CSM1 should load from the palette origin into the CSA-selected temporary CLUT while CT32 ignores CSA bit 4");
         });
 
         tc.Run("GS T4 CSM1 preserves CSA bit 4 for CT16 CLUTs", [](TestCase &t)
@@ -2808,7 +3484,7 @@ void register_ps2_gs_tests()
                 (1ull << 16) |
                 (static_cast<uint64_t>(GS_PSM_CT32) << 24);
             constexpr uint64_t kZbuf = (1ull << 32);
-            constexpr uint64_t kTex0 =
+            constexpr uint64_t kTex0Base =
                 (static_cast<uint64_t>(kTexTbp) << 0) |
                 (1ull << 14) |
                 (static_cast<uint64_t>(GS_PSM_T4) << 20) |
@@ -2817,43 +3493,62 @@ void register_ps2_gs_tests()
                 (1ull << 34) |
                 (1ull << 35) |
                 (static_cast<uint64_t>(kClutCbp) << 37) |
-                (static_cast<uint64_t>(GS_PSM_CT16) << 51) |
-                (16ull << 56);
+                (static_cast<uint64_t>(GS_PSM_CT16) << 51);
             constexpr uint64_t kTexa = (0x80ull << 32);
             constexpr uint64_t kPrim =
                 static_cast<uint64_t>(GS_PRIM_SPRITE) |
                 (1ull << 4) |
                 (1ull << 8);
-            constexpr uint16_t kExpectedRed = 0x801Fu;
-            constexpr uint16_t kWrongGreen = 0x83E0u;
-            constexpr uint32_t kExpectedColor = 0x800000F8u;
+            constexpr uint16_t kLowerGreen = 0x83E0u;
+            constexpr uint16_t kUpperRed = 0x801Fu;
+            constexpr uint32_t kExpectedLowerColor = 0x8000F800u;
+            constexpr uint32_t kExpectedUpperColor = 0x800000F8u;
 
             writePSMT4Texel(vram, kTexTbp, 1u, 0u, 0u, 1u);
 
-            // CSA=16 selects the upper half of a CT16 CLUT. CSM1 swaps bits
-            // 3 and 4 but must preserve address bit 8.
-            gs.WriteVram(GS_PSM_CT16, kClutCbp, 1u, 1u, 0u, kWrongGreen);
-            gs.WriteVram(GS_PSM_CT16, kClutCbp, 1u, 1u, 16u, kExpectedRed);
+            auto tex0For = [&](uint8_t csa, uint8_t cld) -> uint64_t
+            {
+                return kTex0Base |
+                       (static_cast<uint64_t>(csa) << 56) |
+                       (static_cast<uint64_t>(cld) << 61);
+            };
+
+            // CSA selects the destination region in the temporary CLUT, not
+            // an offset into palette VRAM. Load different snapshots from the
+            // same CSM1 source entry into the lower and upper CT16 halves.
+            gs.WriteVram(GS_PSM_CT16, kClutCbp, 1u, 1u, 0u, kLowerGreen);
+            gs.writeRegister(GS_REG_TEX0_1, tex0For(0u, 1u));
+            gs.WriteVram(GS_PSM_CT16, kClutCbp, 1u, 1u, 0u, kUpperRed);
+            gs.writeRegister(GS_REG_TEX0_1, tex0For(16u, 1u));
 
             gs.writeRegister(GS_REG_FRAME_1, kFrameReg);
             gs.writeRegister(GS_REG_ZBUF_1, kZbuf);
-            gs.writeRegister(GS_REG_SCISSOR_1, 0ull);
+            gs.writeRegister(GS_REG_SCISSOR_1, (1ull << 16));
             gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
             gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
             gs.writeRegister(GS_REG_ALPHA_1, 0ull);
-            gs.writeRegister(GS_REG_TEX0_1, kTex0);
             gs.writeRegister(GS_REG_TEXA, kTexa);
             gs.writeRegister(GS_REG_PRIM, kPrim);
             gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
-            gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
-            gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
 
-            uint32_t pixel = 0u;
-            std::memcpy(&pixel, vram.data(), sizeof(pixel));
-            t.Equals(pixel, kExpectedColor,
-                     "CT16 CSM1 should retain CSA[4] instead of aliasing the upper palette onto the lower one");
+            auto drawAt = [&](uint32_t x, uint8_t csa)
+            {
+                gs.writeRegister(GS_REG_TEX0_1, tex0For(csa, 0u));
+                gs.writeRegister(GS_REG_UV, 0ull);
+                gs.writeRegister(GS_REG_XYZ2, static_cast<uint64_t>(x * 16u));
+                gs.writeRegister(GS_REG_UV, 0ull);
+                gs.writeRegister(GS_REG_XYZ2,
+                                 static_cast<uint64_t>((x + 1u) * 16u) |
+                                     (16ull << 16));
+            };
+
+            drawAt(0u, 0u);
+            drawAt(1u, 16u);
+
+            t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, 0u, 0u), kExpectedLowerColor,
+                     "CSA=0 should continue reading the lower CT16 CLUT snapshot");
+            t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, 1u, 0u), kExpectedUpperColor,
+                     "CSA=16 should read the distinct upper CT16 CLUT snapshot instead of aliasing CSA bit 4");
         });
 
         tc.Run("GS TEX0 dimensions saturate at 1024 pixels", [](TestCase &t)
@@ -2913,12 +3608,14 @@ void register_ps2_gs_tests()
                 (1ull << 35) |
                 (static_cast<uint64_t>(kWrongClutCbp) << 37) |
                 (static_cast<uint64_t>(GS_PSM_CT32) << 51) |
-                (1ull << 55);
+                (1ull << 55) |
+                (1ull << 61);
             constexpr uint64_t kTex2 =
                 (static_cast<uint64_t>(GS_PSM_T8) << 20) |
                 (static_cast<uint64_t>(kExpectedClutCbp) << 37) |
                 (static_cast<uint64_t>(GS_PSM_CT32) << 51) |
-                (1ull << 55);
+                (1ull << 55) |
+                (1ull << 61);
             constexpr uint64_t kPrim =
                 static_cast<uint64_t>(GS_PRIM_SPRITE) |
                 (1ull << 4) |
@@ -2955,7 +3652,7 @@ void register_ps2_gs_tests()
                      "TEX2 should override the active CLUT base and format state without requiring a new TEX0 write");
         });
 
-        tc.Run("GS TEXCLUT offsets T8 CLUT fetch coordinates", [](TestCase &t)
+        tc.Run("GS TEXCLUT COU offsets CSM2 CLUT fetches in units of 16 pixels", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
@@ -2978,7 +3675,8 @@ void register_ps2_gs_tests()
                 (1ull << 35) |
                 (static_cast<uint64_t>(kClutCbp) << 37) |
                 (static_cast<uint64_t>(GS_PSM_CT32) << 51) |
-                (1ull << 55);
+                (1ull << 55) |
+                (1ull << 61);
             constexpr uint64_t kTexClut =
                 (1ull << 0) |
                 (3ull << 6) |
@@ -2987,15 +3685,15 @@ void register_ps2_gs_tests()
                 static_cast<uint64_t>(GS_PRIM_SPRITE) |
                 (1ull << 4) |
                 (1ull << 8);
-            constexpr uint32_t kWrongColor = 0xFF00FF00u;
+            constexpr uint32_t kWrongUnscaledColor = 0xFF00FF00u;
             constexpr uint32_t kExpectedColor = 0xFF3366CCu;
 
             const uint32_t texOff = GSPSMT8::addrPSMT8(kTexTbp, 1u, 0u, 0u);
             vram[texOff] = 0u;
 
-            const uint32_t wrongClutOff = GSPSMCT32::addrPSMCT32(kClutCbp, 1u, 0u, 0u);
-            const uint32_t expectedClutOff = GSPSMCT32::addrPSMCT32(kClutCbp, 1u, 3u, 2u);
-            std::memcpy(vram.data() + wrongClutOff, &kWrongColor, sizeof(kWrongColor));
+            const uint32_t wrongUnscaledClutOff = GSPSMCT32::addrPSMCT32(kClutCbp, 1u, 3u, 2u);
+            const uint32_t expectedClutOff = GSPSMCT32::addrPSMCT32(kClutCbp, 1u, 48u, 2u);
+            std::memcpy(vram.data() + wrongUnscaledClutOff, &kWrongUnscaledColor, sizeof(kWrongUnscaledColor));
             std::memcpy(vram.data() + expectedClutOff, &kExpectedColor, sizeof(kExpectedColor));
 
             gs.writeRegister(GS_REG_FRAME_1, kFrameReg);
@@ -3004,8 +3702,8 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
             gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
             gs.writeRegister(GS_REG_ALPHA_1, 0ull);
-            gs.writeRegister(GS_REG_TEX0_1, kTex0);
             gs.writeRegister(GS_REG_TEXCLUT, kTexClut);
+            gs.writeRegister(GS_REG_TEX0_1, kTex0);
             gs.writeRegister(GS_REG_PRIM, kPrim);
             gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
             gs.writeRegister(GS_REG_UV, 0ull);
@@ -3016,7 +3714,206 @@ void register_ps2_gs_tests()
             uint32_t pixel = 0u;
             std::memcpy(&pixel, vram.data(), sizeof(pixel));
             t.Equals(pixel, kExpectedColor,
-                     "TEXCLUT should offset the CLUT lookup coordinates instead of always starting from the CLUT base");
+                     "CSM2 must interpret TEXCLUT.COU=3 as an X offset of 48 pixels, not 3 pixels");
+        });
+
+        tc.Run("GS CSM1 CLUT fetches ignore TEXCLUT offsets", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            constexpr uint32_t kTexTbp = 64u;
+            constexpr uint32_t kClutCbp = 128u;
+            constexpr uint64_t kFrameReg =
+                (1ull << 16) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 24);
+            constexpr uint64_t kTex0 =
+                (static_cast<uint64_t>(kTexTbp) << 0) |
+                (1ull << 14) |
+                (static_cast<uint64_t>(GS_PSM_T8) << 20) |
+                (1ull << 34) |
+                (1ull << 35) |
+                (static_cast<uint64_t>(kClutCbp) << 37) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 51) |
+                (1ull << 61); // CLD=1 forces a CLUT load.
+            constexpr uint64_t kTexClut =
+                (1ull << 0) |
+                (3ull << 6) |
+                (2ull << 12);
+            constexpr uint64_t kPrim =
+                static_cast<uint64_t>(GS_PRIM_SPRITE) |
+                (1ull << 4) |
+                (1ull << 8);
+            constexpr uint32_t kExpectedColor = 0xFF3366CCu;
+            constexpr uint32_t kWrongOffsetColor = 0xFF00FF00u;
+
+            const uint32_t texOff = GSPSMT8::addrPSMT8(kTexTbp, 1u, 0u, 0u);
+            vram[texOff] = 0u;
+
+            const uint32_t expectedClutOff = GSPSMCT32::addrPSMCT32(kClutCbp, 1u, 0u, 0u);
+            const uint32_t wrongOffsetClutOff = GSPSMCT32::addrPSMCT32(kClutCbp, 1u, 48u, 2u);
+            std::memcpy(vram.data() + expectedClutOff, &kExpectedColor, sizeof(kExpectedColor));
+            std::memcpy(vram.data() + wrongOffsetClutOff, &kWrongOffsetColor, sizeof(kWrongOffsetColor));
+
+            gs.writeRegister(GS_REG_FRAME_1, kFrameReg);
+            gs.writeRegister(GS_REG_ZBUF_1, (1ull << 32));
+            gs.writeRegister(GS_REG_SCISSOR_1, 0ull);
+            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(GS_REG_ALPHA_1, 0ull);
+            gs.writeRegister(GS_REG_TEXCLUT, kTexClut);
+            gs.writeRegister(GS_REG_TEX0_1, kTex0);
+            gs.writeRegister(GS_REG_PRIM, kPrim);
+            gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
+            gs.writeRegister(GS_REG_UV, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_UV, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, (16ull << 0) | (16ull << 16));
+
+            uint32_t pixel = 0u;
+            std::memcpy(&pixel, vram.data(), sizeof(pixel));
+            t.Equals(pixel, kExpectedColor,
+                     "CSM1 should fetch its palette from the upper-left of CBP regardless of TEXCLUT.COU/COV");
+        });
+
+        tc.Run("GS CLD controls when indexed textures snapshot palette VRAM", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            constexpr uint32_t kTexTbp = 64u;
+            constexpr uint32_t kClutCbp = 128u;
+            constexpr uint32_t kInitialColor = 0x800000FFu;
+            constexpr uint32_t kUpdatedColor = 0x8000FF00u;
+            constexpr uint64_t kTex0Base =
+                (static_cast<uint64_t>(kTexTbp) << 0) |
+                (1ull << 14) |
+                (static_cast<uint64_t>(GS_PSM_T8) << 20) |
+                (2ull << 26) |
+                (1ull << 34) |
+                (1ull << 35) |
+                (static_cast<uint64_t>(kClutCbp) << 37) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 51);
+            constexpr uint64_t kPrim =
+                static_cast<uint64_t>(GS_PRIM_SPRITE) |
+                (1ull << 4) |
+                (1ull << 8);
+
+            writePSMT8Texel(vram, kTexTbp, 1u, 0u, 0u, 0u);
+            gs.WriteVram(GS_PSM_CT32, kClutCbp, 1u, 0u, 0u, kInitialColor);
+
+            gs.writeRegister(GS_REG_FRAME_1,
+                             (1ull << 16) |
+                                 (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+            gs.writeRegister(GS_REG_ZBUF_1, (1ull << 32));
+            gs.writeRegister(GS_REG_SCISSOR_1, (2ull << 16));
+            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(GS_REG_PRIM, kPrim);
+            gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
+
+            auto drawAt = [&](uint32_t x)
+            {
+                gs.writeRegister(GS_REG_UV, 0ull);
+                gs.writeRegister(GS_REG_XYZ2, static_cast<uint64_t>(x * 16u));
+                gs.writeRegister(GS_REG_UV, 0ull);
+                gs.writeRegister(GS_REG_XYZ2,
+                                 static_cast<uint64_t>((x + 1u) * 16u) |
+                                     (16ull << 16));
+            };
+
+            gs.writeRegister(GS_REG_TEX0_1, kTex0Base | (1ull << 61));
+            drawAt(0u);
+
+            gs.WriteVram(GS_PSM_CT32, kClutCbp, 1u, 0u, 0u, kUpdatedColor);
+            gs.writeRegister(GS_REG_TEX0_1, kTex0Base); // CLD=0: retain the existing CLUT snapshot.
+            drawAt(1u);
+
+            gs.writeRegister(GS_REG_TEX0_1, kTex0Base | (1ull << 61));
+            drawAt(2u);
+
+            t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, 0u, 0u), kInitialColor,
+                     "CLD=1 should copy the initial palette value from VRAM into the temporary CLUT");
+            t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, 1u, 0u), kInitialColor,
+                     "CLD=0 should keep using the cached palette after its backing VRAM is overwritten");
+            t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, 2u, 0u), kUpdatedColor,
+                     "a subsequent CLD=1 should reload the temporary CLUT from updated palette VRAM");
+        });
+
+        tc.Run("GS CLD4 suppresses same-CBP reloads and reloads a different CBP after CLD2", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            constexpr uint32_t kTexTbp = 64u;
+            constexpr uint32_t kClutCbpA = 128u;
+            constexpr uint32_t kClutCbpB = 192u;
+            constexpr uint32_t kColorA = 0x800000FFu;
+            constexpr uint32_t kOverwrittenA = 0x8000FF00u;
+            constexpr uint32_t kColorB = 0x80FF0000u;
+            constexpr uint64_t kTex0Base =
+                (static_cast<uint64_t>(kTexTbp) << 0) |
+                (1ull << 14) |
+                (static_cast<uint64_t>(GS_PSM_T8) << 20) |
+                (2ull << 26) |
+                (1ull << 34) |
+                (1ull << 35) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 51);
+            constexpr uint64_t kPrim =
+                static_cast<uint64_t>(GS_PRIM_SPRITE) |
+                (1ull << 4) |
+                (1ull << 8);
+
+            auto tex0For = [&](uint32_t cbp, uint8_t cld) -> uint64_t
+            {
+                return kTex0Base |
+                       (static_cast<uint64_t>(cbp) << 37) |
+                       (static_cast<uint64_t>(cld) << 61);
+            };
+
+            writePSMT8Texel(vram, kTexTbp, 1u, 0u, 0u, 0u);
+            gs.WriteVram(GS_PSM_CT32, kClutCbpA, 1u, 0u, 0u, kColorA);
+            gs.WriteVram(GS_PSM_CT32, kClutCbpB, 1u, 0u, 0u, kColorB);
+
+            gs.writeRegister(GS_REG_FRAME_1,
+                             (1ull << 16) |
+                                 (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+            gs.writeRegister(GS_REG_ZBUF_1, (1ull << 32));
+            gs.writeRegister(GS_REG_SCISSOR_1, (2ull << 16));
+            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(GS_REG_PRIM, kPrim);
+            gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
+
+            auto drawAt = [&](uint32_t x)
+            {
+                gs.writeRegister(GS_REG_UV, 0ull);
+                gs.writeRegister(GS_REG_XYZ2, static_cast<uint64_t>(x * 16u));
+                gs.writeRegister(GS_REG_UV, 0ull);
+                gs.writeRegister(GS_REG_XYZ2,
+                                 static_cast<uint64_t>((x + 1u) * 16u) |
+                                     (16ull << 16));
+            };
+
+            gs.writeRegister(GS_REG_TEX0_1, tex0For(kClutCbpA, 2u));
+            drawAt(0u);
+
+            gs.WriteVram(GS_PSM_CT32, kClutCbpA, 1u, 0u, 0u, kOverwrittenA);
+            gs.writeRegister(GS_REG_TEX0_1, tex0For(kClutCbpA, 4u));
+            drawAt(1u);
+
+            gs.writeRegister(GS_REG_TEX0_1, tex0For(kClutCbpB, 4u));
+            drawAt(2u);
+
+            t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, 0u, 0u), kColorA,
+                     "CLD=2 should load the CLUT and record CBP0");
+            t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, 1u, 0u), kColorA,
+                     "CLD=4 with the same CBP0 should suppress a palette reload");
+            t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, 2u, 0u), kColorB,
+                     "CLD=4 with a different CBP should reload from that palette and update CBP0");
         });
 
         tc.Run("GS TEXA expands CT24 alpha and honors AEM for black texels", [](TestCase &t)
@@ -3311,7 +4208,8 @@ void register_ps2_gs_tests()
                     (1ull << 34) |
                     (1ull << 35) |
                     (static_cast<uint64_t>(kClutCbp) << 37) |
-                    (static_cast<uint64_t>(GS_PSM_CT32) << 51);
+                    (static_cast<uint64_t>(GS_PSM_CT32) << 51) |
+                    (1ull << 61);
                 constexpr uint64_t kPrim =
                     static_cast<uint64_t>(GS_PRIM_TRIANGLE) |
                     (1ull << 4) |
@@ -3350,7 +4248,10 @@ void register_ps2_gs_tests()
                 gs.writeRegister(GS_REG_RGBAQ, kRgbaq);
                 gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
                 gs.writeRegister(GS_REG_XYZ2, 0ull);
-                gs.writeRegister(GS_REG_ST, packSt(1.0f, 0.0f));
+                // At GS pixel coordinate (1,1), S=0.375 and a two-wide
+                // texture produces U=0.75. Point filtering selects texel 0;
+                // linear filtering retains the fraction and blends 25% white.
+                gs.writeRegister(GS_REG_ST, packSt(1.5f, 0.0f));
                 gs.writeRegister(GS_REG_XYZ2, (64ull << 0) | (0ull << 16));
                 gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
                 gs.writeRegister(GS_REG_XYZ2, (0ull << 0) | (64ull << 16));
@@ -3368,12 +4269,8 @@ void register_ps2_gs_tests()
             t.Equals(nearestPixel, 0x80000000u,
                      "point sampling should keep the sampled STQ triangle pixel on texel 0");
 
-            const uint8_t linearR = static_cast<uint8_t>(linearPixel & 0xFFu);
-            const uint8_t linearA = static_cast<uint8_t>((linearPixel >> 24) & 0xFFu);
-            t.IsTrue(linearR > 0x10u && linearR < 0x70u,
-                     "linear filtering should blend the STQ triangle sample between black and white T4 texels");
-            t.Equals(linearA, static_cast<uint8_t>(0x80u),
-                     "linear filtering should preserve the shared opaque alpha from the CLUT entries");
+            t.Equals(linearPixel, 0x80404040u,
+                     "linear filtering should preserve U=0.75 and blend 4/16 from black toward white");
         });
 
         tc.Run("GS CLAMP modes transform texture coordinates before sampling", [](TestCase &t)
@@ -3517,7 +4414,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
             gs.writeRegister(GS_REG_RGBAQ, packRgbaq(1.0f));
             gs.writeRegister(GS_REG_XYZ2, 0ull);
-            gs.writeRegister(GS_REG_ST, packSt(2.0f, 0.0f));
+            gs.writeRegister(GS_REG_ST, packSt(3.0f, 0.0f));
             gs.writeRegister(GS_REG_RGBAQ, packRgbaq(2.0f));
             gs.writeRegister(GS_REG_XYZ2, 64ull);
             gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
@@ -3527,7 +4424,7 @@ void register_ps2_gs_tests()
             const uint32_t pixel =
                 readReferencePSMCT32Pixel(vram, 0u, 1u, 1u, 1u);
             t.Equals(pixel, kHomogeneousTexel,
-                     "the DDA should interpolate S=0.75 and Q=1.375, selecting texel 2 after S/Q");
+                     "the integer-coordinate DDA should interpolate S=0.75 and Q=1.25, selecting texel 2 after S/Q instead of affine texel 1");
         });
 
         tc.Run("GS alpha-test AFAIL independently masks framebuffer and depth", [](TestCase &t)
@@ -3733,9 +4630,8 @@ void register_ps2_gs_tests()
                 int last = -1;
                 for (uint32_t x = 6u; x <= 26u; ++x)
                 {
-                    const size_t offset = (static_cast<size_t>(y) * 64u + static_cast<size_t>(x)) * 4u;
-                    uint32_t pixel = 0u;
-                    std::memcpy(&pixel, vram.data() + offset, sizeof(pixel));
+                    const uint32_t pixel =
+                        readReferencePSMCT32Pixel(vram, 0u, 1u, x, y);
                     if ((pixel & 0x00FFFFFFu) != 0u)
                     {
                         if (first < 0)
@@ -3754,9 +4650,8 @@ void register_ps2_gs_tests()
                 sawFilledRow = true;
                 for (int x = first; x <= last; ++x)
                 {
-                    const size_t offset = (static_cast<size_t>(y) * 64u + static_cast<size_t>(x)) * 4u;
-                    uint32_t pixel = 0u;
-                    std::memcpy(&pixel, vram.data() + offset, sizeof(pixel));
+                    const uint32_t pixel =
+                        readReferencePSMCT32Pixel(vram, 0u, 1u, static_cast<uint32_t>(x), y);
                     if ((pixel & 0x00FFFFFFu) == 0u)
                     {
                         t.Fail("triangle fan quad should not leave interior holes within a covered row");
@@ -3975,13 +4870,32 @@ void register_ps2_gs_tests()
             setRegU32(resetCtx, 7, 1u);
             ps2_stubs::sceGsResetGraph(rdram.data(), &resetCtx, &runtime);
 
+            runtime.gs().applyDisplayEnvironment(
+                1ull,
+                1ull,
+                150ull | (1ull << 9) |
+                    (static_cast<uint64_t>(GS_PSM_CT32) << 15),
+                0ull,
+                0ull);
+            const uint64_t generationBeforeSync =
+                runtime.gs().hostPresentationGeneration();
             R5900Context sync0{};
             ps2_stubs::sceGsSyncV(rdram.data(), &sync0, &runtime);
-            t.Equals(static_cast<int32_t>(getRegU32Test(sync0, 2)), 0, "first interlaced sceGsSyncV should report even field");
+            const int32_t firstField =
+                static_cast<int32_t>(getRegU32Test(sync0, 2));
+            const uint64_t tickAfterFirst = ps2_syscalls::GetCurrentVSyncTick();
+            t.Equals(firstField, 0, "first interlaced sceGsSyncV should report even field");
+            t.IsTrue(runtime.gs().hostPresentationGeneration() > generationBeforeSync,
+                     "sceGsSyncV should publish the completed guest frame for the host");
 
             R5900Context sync1{};
             ps2_stubs::sceGsSyncV(rdram.data(), &sync1, &runtime);
-            t.Equals(static_cast<int32_t>(getRegU32Test(sync1, 2)), 1, "second interlaced sceGsSyncV should report odd field");
+            const uint64_t tickAfterSecond = ps2_syscalls::GetCurrentVSyncTick();
+            const int32_t expectedSecondField =
+                (firstField + static_cast<int32_t>((tickAfterSecond - tickAfterFirst) & 1u)) & 1;
+            t.Equals(static_cast<int32_t>(getRegU32Test(sync1, 2)),
+                     expectedSecondField,
+                     "sceGsSyncV should report field parity for the elapsed VBlank ticks");
 
             R5900Context resetProgCtx{};
             setRegU32(resetProgCtx, 4, 0u);
@@ -4343,7 +5257,8 @@ void register_ps2_gs_tests()
                 (1ull << 34) |
                 (1ull << 35) |
                 (static_cast<uint64_t>(kClutCbpA) << 37) |
-                (static_cast<uint64_t>(GS_PSM_CT32) << 51);
+                (static_cast<uint64_t>(GS_PSM_CT32) << 51) |
+                (1ull << 61);
 
             gs.writeRegister(GS_REG_FRAME_1, kFrameReg);
             gs.writeRegister(GS_REG_ZBUF_1, kZbuf);
@@ -4355,7 +5270,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_PRIM, kPrim);
             gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
             gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, (16ull << 0) | (16ull << 16));
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
 
@@ -4373,11 +5288,12 @@ void register_ps2_gs_tests()
                 (1ull << 34) |
                 (1ull << 35) |
                 (static_cast<uint64_t>(kClutCbpB) << 37) |
-                (static_cast<uint64_t>(GS_PSM_CT32) << 51);
+                (static_cast<uint64_t>(GS_PSM_CT32) << 51) |
+                (1ull << 61);
 
             gs.writeRegister(GS_REG_TEX0_1, kTex0HH);
             gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, (16ull << 0) | (16ull << 16));
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
 

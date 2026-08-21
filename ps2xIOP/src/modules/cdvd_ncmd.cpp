@@ -153,6 +153,7 @@ namespace ps2x::iop::detail
                 result.handled = true;
                 result.resultAddress = request.receive.address;
                 result.signalNowaitCompletion = request.mode != 0u;
+                result.deferNowaitCompletion = request.mode != 0u;
                 return result;
             }
 

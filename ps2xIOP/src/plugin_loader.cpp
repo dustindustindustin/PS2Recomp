@@ -600,6 +600,7 @@ namespace ps2x::iop::detail
                     result.handled != 0,
                     result.result_address,
                     result.signal_nowait_completion != 0,
+                    false,
                     result.signal_completion != 0,
                     result.callback_policy == PS2X_IOP_CALLBACK_SUPPRESS_V1
                         ? CallbackPolicy::Suppress
