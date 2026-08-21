@@ -43,6 +43,8 @@ namespace ps2_stubs
     void resetSifState();
 }
 
+void SetGsForceBilinearTextures(bool enabled);
+
 #define ELF_MAGIC 0x464C457F // "\x7FELF" in little endian
 #define ET_EXEC 2            // Executable file
 #define EM_MIPS 8            // MIPS architecture
@@ -81,6 +83,9 @@ public:
                                  SWS_BILINEAR, nullptr, nullptr, nullptr);
         if (!frame_ || !packet_ || !scaler_)
             return false;
+        const double declaredRate = av_q2d(format_->streams[stream_]->avg_frame_rate);
+        if (declaredRate >= 1.0 && declaredRate <= 120.0)
+            frameSeconds_ = 1.0 / declaredRate;
         Image image{rgba_.data(), context_->width, context_->height, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
         texture_ = LoadTextureFromImage(image);
         start_ = std::chrono::steady_clock::now();
@@ -106,7 +111,11 @@ public:
         if (!active_)
             return;
         const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_).count();
-        while (nextFrameSeconds_ <= elapsed && decodeOne()) {}
+        uint32_t decoded = 0u;
+        while (nextFrameSeconds_ <= elapsed && decoded < 3u && decodeOne())
+            ++decoded;
+        if (decoded == 3u && nextFrameSeconds_ < elapsed - frameSeconds_)
+            nextFrameSeconds_ = elapsed;
     }
 
 private:
@@ -121,11 +130,9 @@ private:
                 int stride[] = {context_->width * 4};
                 sws_scale(scaler_, frame_->data, frame_->linesize, 0, context_->height, dst, stride);
                 UpdateTexture(texture_, rgba_.data());
-                const AVRational timeBase = format_->streams[stream_]->time_base;
-                if (frame_->best_effort_timestamp != AV_NOPTS_VALUE)
-                    nextFrameSeconds_ = frame_->best_effort_timestamp * av_q2d(timeBase);
-                else
-                    nextFrameSeconds_ += 1.0 / 29.97;
+                // PSS timestamps can restart at pack boundaries. Host pacing
+                // must remain monotonic or one update can consume the file.
+                nextFrameSeconds_ += frameSeconds_;
                 return true;
             }
             if (result != AVERROR(EAGAIN))
@@ -136,7 +143,11 @@ private:
                     start_ = std::chrono::steady_clock::now();
                     nextFrameSeconds_ = 0.0;
                     std::cout << "[startup-video] looping until Start\n";
-                    continue;
+                    // Yield to the host presentation loop after rewinding.
+                    // Continuing here compares the new zero-based timestamps
+                    // against the old elapsed time and can decode the whole
+                    // movie repeatedly without pumping the window event loop.
+                    return false;
                 }
                 active_ = false;
                 return false;
@@ -184,6 +195,7 @@ private:
     std::vector<uint8_t> rgba_;
     std::chrono::steady_clock::time_point start_{};
     double nextFrameSeconds_ = 0.0;
+    double frameSeconds_ = 1.0 / 29.97;
     int stream_ = -1;
     bool active_ = false;
 };
@@ -564,8 +576,7 @@ PS2Runtime::GuestExecutionReleaseScope::~GuestExecutionReleaseScope()
 
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
-    static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
-    static bool s_hasLatchedInitialFrame = false;
+    static uint64_t s_lastPresentationGeneration = 0u;
     static uint32_t s_lastDisplayFbp = std::numeric_limits<uint32_t>::max();
     static uint32_t s_lastSourceFbp = std::numeric_limits<uint32_t>::max();
     static bool s_lastPreferred = false;
@@ -576,14 +587,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
 
     const uint64_t currentTick = ps2_syscalls::GetCurrentVSyncTick();
-    const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
-    if (needsLatch)
-    {
-        rt->gs().latchHostPresentationFrame();
-        s_lastPresentationTick = currentTick;
-        s_hasLatchedInitialFrame = true;
-    }
-    else if (s_hasUploadedFrame)
+    const uint64_t publishedGeneration = rt->gs().hostPresentationGeneration();
+    if (publishedGeneration == s_lastPresentationGeneration && s_hasUploadedFrame)
     {
         outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
         outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
@@ -596,17 +601,17 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     uint32_t displayFbp = 0u;
     uint32_t sourceFbp = 0u;
     bool usedPreferredDisplaySource = false;
+    uint64_t copiedGeneration = 0u;
     if (!rt->gs().copyLatchedHostPresentationFrame(s_scratch,
                                                    width,
                                                    height,
                                                    &displayFbp,
                                                    &sourceFbp,
-                                                   &usedPreferredDisplaySource))
+                                                   &usedPreferredDisplaySource,
+                                                   &copiedGeneration))
     {
-        // A display-register change can briefly point at a frame that the GS has
-        // not finished producing yet.  Keep presenting the last complete frame
-        // and force another latch attempt even if the guest VSync tick stalls.
-        s_hasLatchedInitialFrame = false;
+        // Publication is guest-driven. Keep the last complete frame until the
+        // GS publishes its first (or next) generation.
         if (s_hasUploadedFrame)
         {
             outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
@@ -623,6 +628,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         s_lastHeight = outHeight;
         return;
     }
+
+    s_lastPresentationGeneration = copiedGeneration;
 
     PS2_IF_AGRESSIVE_LOGS({
         static uint32_t s_uploadDebugCount = 0u;
@@ -689,6 +696,192 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                 {
                     const size_t pixelOffset = rowOffset + static_cast<size_t>(x) * 4u;
                     dump.write(reinterpret_cast<const char *>(s_scratch.data() + pixelOffset), 3u);
+                }
+            }
+        }
+    }
+
+    // The normal state snapshot is intentionally sparse, which can alias with
+    // a periodic presentation fault.  When diagnostics are enabled, also keep
+    // a compact per-present trace so transient PMODE changes, RGB dimming, or
+    // non-opaque host pixels cannot hide between one-second samples.
+    if (const char *stateDumpPath = std::getenv("PS2X_GS_STATE_DUMP");
+        stateDumpPath != nullptr && *stateDumpPath != '\0' &&
+        width != 0u && height != 0u && !s_scratch.empty())
+    {
+        static bool s_traceInitialized = false;
+        uint64_t sumR = 0u;
+        uint64_t sumG = 0u;
+        uint64_t sumB = 0u;
+        uint64_t nonBlackPixels = 0u;
+        uint8_t maxRgb = 0u;
+        uint64_t nonOpaquePixels = 0u;
+        uint8_t minAlpha = 0xFFu;
+        uint8_t maxAlpha = 0u;
+        const size_t pixelCount = std::min<size_t>(
+            static_cast<size_t>(width) * static_cast<size_t>(height),
+            s_scratch.size() / 4u);
+        for (size_t pixel = 0u; pixel < pixelCount; ++pixel)
+        {
+            const size_t offset = pixel * 4u;
+            sumR += s_scratch[offset + 0u];
+            sumG += s_scratch[offset + 1u];
+            sumB += s_scratch[offset + 2u];
+            const bool nonBlack = s_scratch[offset + 0u] != 0u ||
+                                  s_scratch[offset + 1u] != 0u ||
+                                  s_scratch[offset + 2u] != 0u;
+            nonBlackPixels += nonBlack ? 1u : 0u;
+            maxRgb = std::max(maxRgb, std::max(s_scratch[offset + 0u],
+                                              std::max(s_scratch[offset + 1u], s_scratch[offset + 2u])));
+            const uint8_t alpha = s_scratch[offset + 3u];
+            minAlpha = std::min(minAlpha, alpha);
+            maxAlpha = std::max(maxAlpha, alpha);
+            nonOpaquePixels += alpha != 0xFFu ? 1u : 0u;
+        }
+
+        const std::string tracePath = std::string(stateDumpPath) + ".trace.tsv";
+        std::ofstream trace(tracePath,
+                            std::ios::out |
+                                (s_traceInitialized ? std::ios::app : std::ios::trunc));
+        if (trace)
+        {
+            if (!s_traceInitialized)
+            {
+                trace << "tick\tpmode\tdispfb1\tdisplay1\tdispfb2\tdisplay2"
+                         "\twidth\theight\tmean_r\tmean_g\tmean_b"
+                         "\tnonblack\tmax_rgb\tdraw_count\tgif_packets"
+                         "\talpha_min\talpha_max\tnonopaque\n";
+            }
+            const GSRegisters &priv = rt->memory().gs();
+            const uint64_t divisor = std::max<uint64_t>(pixelCount, 1u);
+            trace << currentTick
+                  << "\t0x" << std::hex << priv.pmode
+                  << "\t0x" << priv.dispfb1
+                  << "\t0x" << priv.display1
+                  << "\t0x" << priv.dispfb2
+                  << "\t0x" << priv.display2 << std::dec
+                  << '\t' << width
+                  << '\t' << height
+                  << '\t' << (sumR / divisor)
+                  << '\t' << (sumG / divisor)
+                  << '\t' << (sumB / divisor)
+                  << '\t' << nonBlackPixels
+                  << '\t' << static_cast<unsigned int>(maxRgb)
+                  << '\t' << rt->gs().getDebugSnapshot().drawCount
+                  << '\t' << rt->gs().getDebugSnapshot().gifPacketCount
+                  << '\t' << static_cast<unsigned int>(minAlpha)
+                  << '\t' << static_cast<unsigned int>(maxAlpha)
+                  << '\t' << nonOpaquePixels
+                  << '\n';
+            s_traceInitialized = true;
+        }
+    }
+
+    if (const char *stateDumpPath = std::getenv("PS2X_GS_STATE_DUMP");
+        stateDumpPath != nullptr && *stateDumpPath != '\0' &&
+        (currentTick % 60u) == 0u)
+    {
+        const GSDebugSnapshot gs = rt->gs().getDebugSnapshot();
+        const GSRegisters &priv = rt->memory().gs();
+        std::ofstream dump(stateDumpPath, std::ios::trunc);
+        if (dump)
+        {
+            dump << "tick=" << currentTick
+                 << " drawCount=" << gs.drawCount
+                 << " frame=" << width << 'x' << height
+                 << " displayFbp=" << displayFbp
+                 << " sourceFbp=" << sourceFbp
+                 << " preferred=" << static_cast<unsigned int>(usedPreferredDisplaySource)
+                 << '\n';
+            dump << "PMODE=0x" << std::hex << priv.pmode
+                 << " SMODE2=0x" << priv.smode2
+                 << " DISPFB1=0x" << priv.dispfb1
+                 << " DISPLAY1=0x" << priv.display1
+                 << " DISPFB2=0x" << priv.dispfb2
+                 << " DISPLAY2=0x" << priv.display2 << std::dec << '\n';
+            dump << "PRIM type=" << static_cast<unsigned int>(gs.prim.type)
+                 << " tme=" << static_cast<unsigned int>(gs.prim.tme)
+                 << " abe=" << static_cast<unsigned int>(gs.prim.abe)
+                 << " aa1=" << static_cast<unsigned int>(gs.prim.aa1)
+                 << " fst=" << static_cast<unsigned int>(gs.prim.fst)
+                 << " ctxt=" << static_cast<unsigned int>(gs.prim.ctxt)
+                 << " dthe=" << static_cast<unsigned int>(gs.dthe)
+                 << " colclamp=" << static_cast<unsigned int>(gs.colclamp)
+                 << '\n';
+
+            for (size_t i = 0; i < 2u; ++i)
+            {
+                const GSContext &ctx = gs.ctx[i];
+                const uint8_t mmag = static_cast<uint8_t>((ctx.tex1 >> 5u) & 0x1u);
+                const uint8_t mmin = static_cast<uint8_t>((ctx.tex1 >> 6u) & 0x7u);
+                dump << "CTX" << i
+                     << " FRAME fbp=" << ctx.frame.fbp
+                     << " fbw=" << ctx.frame.fbw
+                     << " psm=0x" << std::hex << static_cast<unsigned int>(ctx.frame.psm)
+                     << " fbmsk=0x" << ctx.frame.fbmsk << std::dec
+                     << " TEX0 tbp=" << ctx.tex0.tbp0
+                     << " tbw=" << static_cast<unsigned int>(ctx.tex0.tbw)
+                     << " psm=0x" << std::hex << static_cast<unsigned int>(ctx.tex0.psm) << std::dec
+                     << " size=" << (1u << std::min<uint32_t>(ctx.tex0.tw, 10u))
+                     << 'x' << (1u << std::min<uint32_t>(ctx.tex0.th, 10u))
+                     << " cbp=" << ctx.tex0.cbp
+                     << " cpsm=0x" << std::hex << static_cast<unsigned int>(ctx.tex0.cpsm) << std::dec
+                     << " csm=" << static_cast<unsigned int>(ctx.tex0.csm)
+                     << " csa=" << static_cast<unsigned int>(ctx.tex0.csa)
+                     << " cld=" << static_cast<unsigned int>(ctx.tex0.cld)
+                     << " TEX1=0x" << std::hex << ctx.tex1 << std::dec
+                     << " mmag=" << static_cast<unsigned int>(mmag)
+                     << " mmin=" << static_cast<unsigned int>(mmin)
+                     << " ALPHA=0x" << std::hex << ctx.alpha
+                     << " TEST=0x" << ctx.test
+                     << " CLAMP=0x" << ctx.clamp << std::dec
+                     << '\n';
+            }
+
+            const std::vector<GSDebugHistoryEntry> history = rt->gs().getDebugHistory();
+            uint32_t latestDrawFrame = 0u;
+            bool hasDrawFrame = false;
+            for (auto it = history.rbegin(); it != history.rend(); ++it)
+            {
+                if (it->kind == GSDebugEventKind::Draw)
+                {
+                    latestDrawFrame = it->frameIndex;
+                    hasDrawFrame = true;
+                    break;
+                }
+            }
+
+            if (hasDrawFrame)
+            {
+                dump << "DRAWS frameIndex=" << latestDrawFrame << '\n';
+                for (const GSDebugHistoryEntry &draw : history)
+                {
+                    if (draw.kind != GSDebugEventKind::Draw || draw.frameIndex != latestDrawFrame)
+                        continue;
+
+                    const uint8_t mmag = static_cast<uint8_t>((draw.tex1 >> 5u) & 0x1u);
+                    const uint8_t mmin = static_cast<uint8_t>((draw.tex1 >> 6u) & 0x7u);
+                    dump << "DRAW seq=" << draw.seq
+                         << " prim=" << static_cast<unsigned int>(draw.prim.type)
+                         << " tme=" << static_cast<unsigned int>(draw.prim.tme)
+                         << " abe=" << static_cast<unsigned int>(draw.prim.abe)
+                         << " fst=" << static_cast<unsigned int>(draw.prim.fst)
+                         << " ctxt=" << static_cast<unsigned int>(draw.prim.ctxt)
+                         << " xy=" << draw.xMin << ',' << draw.yMin
+                         << ".." << draw.xMax << ',' << draw.yMax
+                         << " frame=" << draw.frame.fbp << '/' << draw.frame.fbw
+                         << "/0x" << std::hex << static_cast<unsigned int>(draw.frame.psm) << std::dec
+                         << " tex=" << draw.tex0.tbp0 << '/' << static_cast<unsigned int>(draw.tex0.tbw)
+                         << "/0x" << std::hex << static_cast<unsigned int>(draw.tex0.psm) << std::dec
+                         << " cbp=" << draw.tex0.cbp
+                         << " cpsm=0x" << std::hex << static_cast<unsigned int>(draw.tex0.cpsm) << std::dec
+                         << " tex1=0x" << std::hex << draw.tex1 << std::dec
+                         << " mmag=" << static_cast<unsigned int>(mmag)
+                         << " mmin=" << static_cast<unsigned int>(mmin)
+                         << " clamp=0x" << std::hex << draw.clamp
+                         << " alpha=0x" << draw.alpha
+                         << " test=0x" << draw.test << std::dec
+                         << '\n';
                 }
             }
         }
@@ -2937,10 +3130,20 @@ void PS2Runtime::run()
     }
 #endif
 #if !defined(PLATFORM_VITA)
-    // Point filtering is the default so integer-sized windows keep PS2 text
-    // and UI pixels crisp. F9 lets the player opt into smoother scaling.
-    bool useBilinearScaling = false;
-    SetTextureFilter(frameTex, TEXTURE_FILTER_POINT);
+    // The PS2 output is usually enlarged by a non-integer amount on modern
+    // displays.  Point sampling at those scales turns the game's native
+    // 16-bit dithering and one-pixel text shadows into uneven blocks, which
+    // makes the small UI font unnecessarily difficult to read.  Smooth the
+    // host presentation by default; F9 still provides point sampling for
+    // pixel-level graphics debugging.
+    bool useBilinearScaling = true;
+    SetTextureFilter(frameTex, TEXTURE_FILTER_BILINEAR);
+    SetTextureWrap(frameTex, TEXTURE_WRAP_CLAMP);
+    const char *forcedTextureFilter = std::getenv("PS2X_FORCE_BILINEAR_TEXTURES");
+    bool forceBilinearTextures = forcedTextureFilter != nullptr &&
+                                 *forcedTextureFilter != '\0' &&
+                                 std::strcmp(forcedTextureFilter, "0") != 0;
+    SetGsForceBilinearTextures(forceBilinearTextures);
 #endif
 
     g_activeThreads.store(1, std::memory_order_relaxed);
@@ -3014,7 +3217,10 @@ void PS2Runtime::run()
         const bool startupWasActive = startupVideo.active();
         if (startupWasActive &&
             (IsKeyPressed(KEY_ENTER) ||
-             (IsGamepadAvailable(0) && IsGamepadButtonPressed(0, GAMEPAD_BUTTON_MIDDLE_RIGHT))))
+             (IsGamepadAvailable(0) && IsGamepadButtonPressed(0, GAMEPAD_BUTTON_MIDDLE_RIGHT)) ||
+             ((automatedStart || automatedNewGame || automatedContinue ||
+               automatedLevelSelect) &&
+              hostFrame >= 120u)))
             startupVideo.skip();
         startupVideo.update();
 #endif
@@ -3036,9 +3242,13 @@ void PS2Runtime::run()
             const bool pressDown =
                 automatedContinue && hostFrame >= automatedContinueFrame &&
                 hostFrame < automatedContinueFrame + 6u;
+            const bool pulseAutomatedStart =
+                automatedStart && hostFrame >= 120u &&
+                ((hostFrame - 120u) % 120u) < 6u;
             const bool pressStart =
-                !pressCross && !pressDown && hostFrame >= 120u &&
-                hostFrame < 126u;
+                !pressCross && !pressDown &&
+                (pulseAutomatedStart ||
+                 (!automatedStart && hostFrame >= 120u && hostFrame < 126u));
             if (pressCross)
             {
                 ps2_stubs::setPadOverrideState(0xBFFFu, 0x80u, 0x80u, 0x80u, 0x80u);
@@ -3150,6 +3360,13 @@ void PS2Runtime::run()
                              useBilinearScaling ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
             RUNTIME_LOG("[display] scaling filter="
                         << (useBilinearScaling ? "bilinear" : "nearest"));
+        }
+        if (IsKeyPressed(KEY_F10))
+        {
+            forceBilinearTextures = !forceBilinearTextures;
+            SetGsForceBilinearTextures(forceBilinearTextures);
+            RUNTIME_LOG("[display] GS texture filter="
+                        << (forceBilinearTextures ? "forced bilinear" : "accurate TEX1"));
         }
 #endif
 

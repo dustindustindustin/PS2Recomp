@@ -355,8 +355,17 @@ namespace ps2_syscalls
             tickValue = ++g_vsync_tick_counter;
         }
 
-        g_vsync_cv.notify_all();
         updateGsCsrFieldForVSync(runtime, tickValue);
+
+        if (runtime != nullptr && runtime->syncCoreSubsystems())
+        {
+            // Publish the completed display page before VBlank wakes guest
+            // code and callbacks that may begin clearing/drawing the next
+            // frame. The host presents only this immutable snapshot.
+            runtime->gs().latchHostPresentationFrame();
+        }
+
+        g_vsync_cv.notify_all();
 
         if (reg.flagAddr != 0u)
         {

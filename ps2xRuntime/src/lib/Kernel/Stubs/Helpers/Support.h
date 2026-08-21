@@ -1880,14 +1880,15 @@ namespace
     {
         if (!runtime || !runtime->syncCoreSubsystems())
             return;
-        auto &regs = runtime->memory().gs();
-        regs.pmode = env.pmode;
-        regs.smode2 = env.smode2;
-        regs.dispfb1 = env.dispfb;
-        regs.display1 = env.display;
-        regs.dispfb2 = env.dispfb;
-        regs.display2 = env.display;
-        regs.bgcolor = env.bgcolor;
+        runtime->gs().applyDisplayEnvironment(env.pmode,
+                                              env.smode2,
+                                              env.dispfb,
+                                              env.display,
+                                              env.bgcolor);
+        // The selected display page contains the frame the guest just
+        // completed. Publish it before a swap configures and clears the next
+        // draw page, so the host cannot observe that clear as a partial frame.
+        runtime->gs().latchHostPresentationFrame();
     }
 
     static void applyGsRegPairs(PS2Runtime *runtime, const GsRegPairMem *pairs, size_t pairCount)

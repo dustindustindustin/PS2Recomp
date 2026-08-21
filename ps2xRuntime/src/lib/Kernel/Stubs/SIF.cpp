@@ -129,7 +129,15 @@ namespace ps2_stubs
         constexpr uint32_t kSifRpcEndCommand = 0x80000008u;
         constexpr uint32_t kSifRpcBindCommand = 0x80000009u;
         constexpr uint32_t kSifRpcCallCommand = 0x8000000Au;
-        constexpr uint32_t kRawSifRpcServerToken = 0x00010000u;
+        constexpr uint32_t kRawSifRpcServerTokenBase = 0x00010000u;
+
+        uint32_t rawSifRpcServerToken(uint32_t sid)
+        {
+            // A bound server pointer is an opaque identity, not one global
+            // sentinel. SDK clients use it to distinguish multiple services
+            // (including PADMAN's two SIDs) that share one host module.
+            return kRawSifRpcServerTokenBase | (sid & 0xFFFFu);
+        }
 
         bool copyGuestByteRange(uint8_t *rdram,
                                 uint32_t dstAddr,
@@ -432,6 +440,7 @@ namespace ps2_stubs
                         std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
                         g_rawSifRpcClients[client] = sid;
                     }
+                    const uint32_t serverToken = rawSifRpcServerToken(sid);
                     return writeRawSifRpcEnd(rdram,
                                              ctx,
                                              runtime,
@@ -440,7 +449,7 @@ namespace ps2_stubs
                                              rpcId,
                                              client,
                                              command,
-                                             kRawSifRpcServerToken);
+                                             serverToken);
                 }
 
                 if (command != kSifRpcCallCommand)
@@ -495,7 +504,7 @@ namespace ps2_stubs
 
                 ps2x::iop::RpcRequest request{};
                 request.clientAddress = client;
-                request.serverAddress = kRawSifRpcServerToken;
+                request.serverAddress = rawSifRpcServerToken(sid);
                 request.sid = sid;
                 request.function = function;
                 request.mode = mode;
@@ -508,6 +517,13 @@ namespace ps2_stubs
                 {
                     continue;
                 }
+
+                // sceSifCallRpc publishes a nonzero request packet in the
+                // client data before a NOWAIT transfer is sent. Raw DMA
+                // callers rely on that ownership marker to avoid reusing the
+                // packet until RPC_END clears it. Preserve that lifecycle even
+                // when the host handles the IOP request synchronously.
+                (void)writeGuestU32(rdram, client, packetTransfer.src);
                 if (receiveAddress != 0u && receiveSize != 0u &&
                     result.resultAddress != 0u &&
                     result.resultAddress != receiveAddress)
@@ -520,7 +536,9 @@ namespace ps2_stubs
                         continue;
                     }
                 }
-                if (result.signalNowaitCompletion && mode != 0u)
+                if (result.signalNowaitCompletion &&
+                    result.deferNowaitCompletion &&
+                    mode != 0u)
                 {
                     uint32_t endFunction = 0u;
                     (void)readGuestU32(rdram, client + 0x1Cu, endFunction);

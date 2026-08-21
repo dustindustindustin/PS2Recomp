@@ -231,6 +231,9 @@ struct GSDebugSnapshot
     GSPrimReg prim{};
     GSTexaReg texa{};
     GSTexClutReg texclut{};
+    std::array<std::array<int8_t, 4>, 4> dimx{};
+    bool dthe = false;
+    bool colclamp = false;
     GSBitBltBuf bitbltbuf{};
     GSTrxPos trxpos{};
     GSTrxReg trxreg{};
@@ -285,6 +288,8 @@ struct GSDebugHistoryEntry
     GSZbufReg zbuf{};
     GSTex0Reg tex0{};
     GSScissorReg scissor{};
+    uint64_t tex1 = 0;
+    uint64_t clamp = 0;
     uint64_t test = 0;
     uint64_t alpha = 0;
 
@@ -348,12 +353,19 @@ public:
     void setDebugHistoryPaused(bool paused);
     bool getPreferredDisplaySource(GSFrameReg &outSource, uint32_t &outDestFbp) const;
     void latchHostPresentationFrame();
+    void applyDisplayEnvironment(uint64_t pmode,
+                                 uint64_t smode2,
+                                 uint64_t dispfb,
+                                 uint64_t display,
+                                 uint64_t bgcolor);
     bool copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                                           uint32_t &outWidth,
                                           uint32_t &outHeight,
                                           uint32_t *outDisplayFbp = nullptr,
                                           uint32_t *outSourceFbp = nullptr,
-                                          bool *outUsedPreferred = nullptr) const;
+                                          bool *outUsedPreferred = nullptr,
+                                          uint64_t *outGeneration = nullptr) const;
+    uint64_t hostPresentationGeneration() const;
     bool clearFramebufferContext(uint32_t contextIndex, uint32_t rgba);
     bool clearActiveFramebuffer(uint32_t rgba);
     uint64_t nativeImageUploadCount() const { return m_nativeImageUploadCount; }
@@ -371,6 +383,12 @@ private:
     void writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi);
     void vertexKick(bool drawing);
     void latchHostPresentationFrameUnlocked();
+    void publishHostPresentationFrameUnlocked(std::vector<uint8_t> &&pixels,
+                                              uint32_t width,
+                                              uint32_t height,
+                                              uint32_t displayFbp,
+                                              uint32_t sourceFbp,
+                                              bool usedPreferred);
 
     void recordDebugEventUnlocked(GSDebugHistoryEntry entry);
     GSDebugHistoryEntry makeDebugEventUnlocked(GSDebugEventKind kind) const;
@@ -382,6 +400,8 @@ private:
 
     void processImageData(const uint8_t *data, uint32_t sizeBytes);
     bool tryProcessNativeImageUploadPacket(const uint8_t *data, uint32_t sizeBytes);
+    void updateClut(const GSTex0Reg &tex0);
+    void loadClut(const GSTex0Reg &tex0);
     void performLocalToLocalTransfer();
     void performLocalToHostToBuffer();
     bool copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
@@ -415,8 +435,14 @@ private:
 
     bool m_prmodecont = true;
     bool m_pabe = false;
+    std::array<std::array<int8_t, 4>, 4> m_dimx{};
+    bool m_dthe = false;
+    bool m_colclamp = false;
     GSTexaReg m_texa{0u, false, 0u};
     GSTexClutReg m_texclut{0u, 0u, 0u};
+    std::array<uint16_t, 512> m_clut{};
+    uint32_t m_clutCbp0 = 0u;
+    uint32_t m_clutCbp1 = 0u;
 
     GSBitBltBuf m_bitbltbuf{};
     GSTrxPos m_trxpos{};
@@ -442,6 +468,7 @@ private:
     GSFrameReg m_preferredDisplaySourceFrame{};
     uint32_t m_preferredDisplayDestFbp = 0;
     bool m_hasPreferredDisplaySource = false;
+    mutable std::mutex m_hostPresentationMutex;
     std::vector<uint8_t> m_hostPresentationFrame;
     uint32_t m_hostPresentationWidth = 0;
     uint32_t m_hostPresentationHeight = 0;
@@ -449,6 +476,7 @@ private:
     uint32_t m_hostPresentationSourceFbp = 0;
     bool m_hostPresentationUsedPreferred = false;
     bool m_hasHostPresentationFrame = false;
+    uint64_t m_hostPresentationGeneration = 0u;
     uint64_t m_nativeImageUploadCount = 0;
     uint64_t m_nativePackedGIFPacketCount = 0;
     uint64_t m_gifPacketCount = 0;
