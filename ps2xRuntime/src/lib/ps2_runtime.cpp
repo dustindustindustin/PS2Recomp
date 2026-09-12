@@ -3345,6 +3345,17 @@ void PS2Runtime::run()
         UploadFrame(frameTex, this, presentWidth, presentHeight);
 
 #if !defined(PLATFORM_VITA)
+        // F8 saves the bounded diagnostic history without enabling continuous
+        // logging. The remaining keys control presentation behavior.
+        if (IsKeyPressed(KEY_F8))
+        {
+            ps2_log::record_diagnostic_event("user", "manual diagnostic dump");
+            const std::string path = ps2_log::diagnostic_dump_path();
+            if (ps2_log::dump_diagnostic_events(path))
+                std::cout << "Diagnostic history saved to " << path << '\n';
+            else
+                std::cerr << "Failed to save diagnostic history to " << path << '\n';
+        }
         // F11 and Alt+Enter are the conventional fullscreen shortcuts. F9
         // switches between crisp nearest-neighbour and smooth bilinear output.
         if (IsKeyPressed(KEY_F11) ||
