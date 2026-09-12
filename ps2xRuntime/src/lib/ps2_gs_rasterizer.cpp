@@ -22,7 +22,6 @@ using namespace GSInternal;
 namespace
 {
     std::atomic<bool> g_forceBilinearTextures{false};
-
     float fabsQ(float q)
     {
         return (std::fabs(q) > 1.0e-8f) ? q : 1.0f;
@@ -1047,6 +1046,19 @@ void GSRasterizer::drawTriangle(GS *gs)
         isTopLeft(fx[2], fy[2], fx[0], fy[0]),
         isTopLeft(fx[0], fy[0], fx[1], fy[1])};
     const double invArea = 1.0 / area;
+    const bool halfPixelHalfTexelFst = gs->m_prim.fst &&
+        std::all_of(fx.begin(), fx.end(), [](float value)
+        {
+            return std::fabs(std::fmod(value, 1.0f)) == 0.5f;
+        }) &&
+        std::all_of(fy.begin(), fy.end(), [](float value)
+        {
+            return std::fabs(std::fmod(value, 1.0f)) == 0.5f;
+        }) &&
+        std::all_of(vertex.begin(), vertex.end(), [](const GSVertex *value)
+        {
+            return (value->u & 0xFu) == 8u && (value->v & 0xFu) == 8u;
+        });
 
     for (int y = minY; y <= maxY; ++y)
     {
@@ -1103,8 +1115,25 @@ void GSRasterizer::drawTriangle(GS *gs)
                 uint16_t iu, iv;
                 if (gs->m_prim.fst)
                 {
-                    iu = static_cast<uint16_t>(i0.u * w0 + i1.u * w1 + i2.u * w2);
-                    iv = static_cast<uint16_t>(i0.v * w0 + i1.v * w1 + i2.v * w2);
+                    const double interpolatedU = i0.u * w0 + i1.u * w1 + i2.u * w2;
+                    const double interpolatedV = i0.v * w0 + i1.v * w1 + i2.v * w2;
+
+                    // The GS triangle DDA resolves an exact fixed-point texel
+                    // boundary toward the preceding coordinate. This matters
+                    // for point-filtered font atlases whose vertices sit at
+                    // half-pixel/half-texel positions: the first covered pixel
+                    // otherwise advances one full atlas column and slices every
+                    // glyph. Preserve ordinary fractional prestep values.
+                    const auto quantizeFst = [halfPixelHalfTexelFst](double value) -> uint16_t
+                    {
+                        int fixed = static_cast<int>(value);
+                        if (halfPixelHalfTexelFst && fixed > 0 &&
+                            value == static_cast<double>(fixed) && (fixed & 0xF) == 0)
+                            --fixed;
+                        return static_cast<uint16_t>(clampInt(fixed, 0, 0xFFFF));
+                    };
+                    iu = quantizeFst(interpolatedU);
+                    iv = quantizeFst(interpolatedV);
                     is = 0.0f;
                     it = 0.0f;
                     iq = 1.0f;

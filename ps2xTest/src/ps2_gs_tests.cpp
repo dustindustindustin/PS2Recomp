@@ -1553,6 +1553,60 @@ void register_ps2_gs_tests()
                      "bilinear sampling should retain U=0.75 and blend 4/16 toward texel 1");
         });
 
+        tc.Run("point-filtered FST triangles resolve exact texel boundaries backward", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            constexpr uint32_t kTexTbp = 64u;
+            constexpr uint32_t kFirstTexel = 0x80FFFFFFu;
+            constexpr uint32_t kNextTexel = 0x80000000u;
+            constexpr uint64_t kFrame =
+                (1ull << 16) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 24);
+            constexpr uint64_t kTex0 =
+                (static_cast<uint64_t>(kTexTbp) << 0) |
+                (1ull << 14) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 20) |
+                (4ull << 26) |
+                (4ull << 30) |
+                (1ull << 34) |
+                (1ull << 35);
+            constexpr uint64_t kPrim =
+                static_cast<uint64_t>(GS_PRIM_TRIANGLE) |
+                (1ull << 4) |
+                (1ull << 8);
+
+            writeReferencePSMCT32Pixel(vram, kTexTbp, 1u, 0u, 0u, kFirstTexel);
+            writeReferencePSMCT32Pixel(vram, kTexTbp, 1u, 1u, 1u, kNextTexel);
+
+            gs.writeRegister(GS_REG_FRAME_1, kFrame);
+            gs.writeRegister(GS_REG_ZBUF_1, (1ull << 32));
+            gs.writeRegister(GS_REG_SCISSOR_1, (15ull << 16) | (15ull << 48));
+            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(GS_REG_TEX0_1, kTex0);
+            gs.writeRegister(GS_REG_TEX1_1, 0ull);
+            gs.writeRegister(GS_REG_CLAMP_1, 1ull | (1ull << 2));
+            gs.writeRegister(GS_REG_PRIM, kPrim);
+            gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
+
+            // This is the coordinate pattern used by Duelists' compact font:
+            // half-pixel vertices paired with half-texel UVs. At GS pixel
+            // (1,1), interpolation lands exactly on fixed UV (1.0,1.0), whose
+            // point-sampling tie belongs to atlas texel (0,0).
+            gs.writeRegister(GS_REG_UV, 8ull | (8ull << 16));
+            gs.writeRegister(GS_REG_XYZ2, 8ull | (8ull << 16));
+            gs.writeRegister(GS_REG_UV, 136ull | (8ull << 16));
+            gs.writeRegister(GS_REG_XYZ2, 136ull | (8ull << 16));
+            gs.writeRegister(GS_REG_UV, 8ull | (200ull << 16));
+            gs.writeRegister(GS_REG_XYZ2, 8ull | (200ull << 16));
+
+            t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, 1u, 1u), kFirstTexel,
+                     "exact FST boundaries should retain the first glyph-atlas column");
+        });
+
         tc.Run("fullscreen display copy tracks the preferred presentation source frame", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
