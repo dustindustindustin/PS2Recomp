@@ -8,6 +8,7 @@
 #include "ps2_syscalls.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_gs_memory.h"
+#include "runtime/ps2_gs_render_queue.h"
 #include <atomic>
 #include <algorithm>
 #include <cmath>
@@ -17,6 +18,7 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <utility>
 
 namespace
 {
@@ -317,10 +319,10 @@ namespace
                     uint32_t pixel = srcPixel;
                     if (ctx.frame.fbmsk != 0u)
                     {
-                        const u32 c = gs->ReadVram(fpsm, fbp, fbw, x, y);
+                        const u32 c = gs->readVramPixel(fpsm, fbp, fbw, x, y);
                         pixel = (pixel & ~ctx.frame.fbmsk) | (c & ctx.frame.fbmsk);
                     }
-                    gs->WriteVram(fpsm, fbp, fbw, x, y, pixel);
+                    gs->writeVramPixel(fpsm, fbp, fbw, x, y, pixel);
                 }
             }
             return true;
@@ -340,10 +342,10 @@ namespace
                     uint16_t pixel = srcPixel;
                     if (mask != 0u)
                     {
-                        const u16 c = gs->ReadVram(fpsm, fbp, fbw, x, y);
+                        const u16 c = gs->readVramPixel(fpsm, fbp, fbw, x, y);
                         pixel = static_cast<uint16_t>((pixel & ~mask) | (c & mask));
                     }
-                    gs->WriteVram(fpsm, fbp, fbw, x, y, pixel);
+                    gs->writeVramPixel(fpsm, fbp, fbw, x, y, pixel);
                 }
             }
             return true;
@@ -438,15 +440,384 @@ GS::GS()
 
 void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
 {
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     m_vram = vram;
     m_vramSize = vramSize;
     m_privRegs = privRegs;
+    if (m_vramAccessTrackingEnabled)
+    {
+        if (m_vramTrackingGeneration != UINT64_MAX)
+            ++m_vramTrackingGeneration;
+        std::fill(m_vramBlockVersions.begin(), m_vramBlockVersions.end(), 0u);
+        std::fill(m_vramReadOperationStamps.begin(), m_vramReadOperationStamps.end(), 0u);
+        std::fill(m_vramWriteOperationStamps.begin(), m_vramWriteOperationStamps.end(), 0u);
+    }
     reset();
+}
+
+bool GS::copyVramBytes(size_t offset, void *dst, size_t sizeBytes) const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    return copyVramRangeUnlocked(offset, dst, sizeBytes);
+}
+
+bool GS::writeVramBytes(size_t offset, const void *src, size_t sizeBytes)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if ((!src && sizeBytes != 0u) || (!m_vram && sizeBytes != 0u) ||
+        offset > m_vramSize || sizeBytes > m_vramSize - offset)
+        return false;
+    if (sizeBytes != 0u)
+    {
+        beginOperationUnlocked();
+        std::memcpy(m_vram + offset, src, sizeBytes);
+        recordVramAccessUnlocked(static_cast<uint32_t>(offset), static_cast<uint32_t>(sizeBytes), GSVramAccessKind::Write);
+    }
+    return true;
+}
+
+bool GS::fillVramBytes(size_t offset, uint8_t value, size_t sizeBytes)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if ((!m_vram && sizeBytes != 0u) || offset > m_vramSize || sizeBytes > m_vramSize - offset)
+        return false;
+    if (sizeBytes != 0u)
+    {
+        beginOperationUnlocked();
+        std::fill_n(m_vram + offset, sizeBytes, value);
+        recordVramAccessUnlocked(static_cast<uint32_t>(offset), static_cast<uint32_t>(sizeBytes), GSVramAccessKind::Write);
+    }
+    return true;
+}
+
+uint32_t GS::readVramPixel(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    return ReadVram(psm, base, bw, x, y);
+}
+
+void GS::writeVramPixel(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    beginOperationUnlocked();
+    WriteVram(psm, base, bw, x, y, value);
+}
+
+uint64_t GS::operationSequence() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    return m_operationSequence;
+}
+
+bool GS::commitCT32PointPatch(uint64_t expectedOperationSequence,
+                              uint32_t destinationByteOffset,
+                              uint32_t rgba32)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (expectedOperationSequence != m_operationSequence || !m_vram ||
+        (destinationByteOffset & 3u) != 0u ||
+        destinationByteOffset > m_vramSize || sizeof(rgba32) > m_vramSize - destinationByteOffset)
+        return false;
+    beginOperationUnlocked();
+    std::memcpy(m_vram + destinationByteOffset, &rgba32, sizeof(rgba32));
+    recordVramAccessUnlocked(destinationByteOffset, sizeof(rgba32), GSVramAccessKind::Write);
+    return true;
+}
+
+void GS::setVramAccessTrackingEnabled(bool enabled)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (m_vramAccessTrackingEnabled == enabled)
+        return;
+    m_vramAccessTrackingEnabled = enabled;
+    if (m_vramTrackingGeneration != UINT64_MAX)
+        ++m_vramTrackingGeneration;
+    m_vramBlockVersions.clear();
+    m_vramReadOperationStamps.clear();
+    m_vramWriteOperationStamps.clear();
+    if (!enabled)
+        return;
+
+    const size_t blockCount = (GSMem::MEMORY_SIZE + kVramTrackingGranularity - 1u) / kVramTrackingGranularity;
+    m_vramBlockVersions.assign(blockCount, 0u);
+    m_vramReadOperationStamps.assign(blockCount, 0u);
+    m_vramWriteOperationStamps.assign(blockCount, 0u);
+}
+
+bool GS::vramAccessTrackingEnabled() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    return m_vramAccessTrackingEnabled;
+}
+
+GSVramOperationAccesses GS::vramOperationAccesses(uint64_t operationSequence) const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    GSVramOperationAccesses result{};
+    result.operationSequence = operationSequence;
+    if (!m_vramAccessTrackingEnabled)
+        return result;
+    result.readRanges = collectVramOperationRangesUnlocked(operationSequence, GSVramAccessKind::Read);
+    result.writeRanges = collectVramOperationRangesUnlocked(operationSequence, GSVramAccessKind::Write);
+    return result;
+}
+
+GSVramRangeVersionSnapshot GS::captureVramRangeVersion(uint32_t offset, uint32_t sizeBytes) const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    GSVramRangeVersionSnapshot result{};
+    result.offset = offset;
+    result.sizeBytes = sizeBytes;
+    result.trackerGeneration = m_vramTrackingGeneration;
+    if (!m_vramAccessTrackingEnabled || offset > m_vramSize || sizeBytes > m_vramSize - offset)
+        return result;
+    const size_t first = offset / kVramTrackingGranularity;
+    const size_t last = sizeBytes == 0u ? first : (static_cast<size_t>(offset) + sizeBytes - 1u) / kVramTrackingGranularity;
+    if (sizeBytes != 0u)
+        result.blockVersions.assign(m_vramBlockVersions.begin() + first, m_vramBlockVersions.begin() + last + 1u);
+    result.valid = true;
+    return result;
+}
+
+bool GS::isVramRangeVersionCurrent(const GSVramRangeVersionSnapshot &snapshot) const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (!snapshot.valid || !m_vramAccessTrackingEnabled ||
+        snapshot.trackerGeneration != m_vramTrackingGeneration ||
+        snapshot.offset > m_vramSize || snapshot.sizeBytes > m_vramSize - snapshot.offset)
+        return false;
+    const size_t first = snapshot.offset / kVramTrackingGranularity;
+    const size_t last = snapshot.sizeBytes == 0u ? first :
+        (static_cast<size_t>(snapshot.offset) + snapshot.sizeBytes - 1u) / kVramTrackingGranularity;
+    const size_t expectedCount = snapshot.sizeBytes == 0u ? 0u : last - first + 1u;
+    if (snapshot.blockVersions.size() != expectedCount)
+        return false;
+    for (size_t i = 0; i < expectedCount; ++i)
+        if (snapshot.blockVersions[i] != m_vramBlockVersions[first + i])
+            return false;
+    return true;
+}
+
+void GS::setSubmissionDiagnosticsEnabled(bool enabled)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    m_submissionDiagnosticsEnabled = enabled;
+    m_lastSubmissionDiagnostic = {};
+}
+
+GSSubmissionDiagnostic GS::lastSubmissionDiagnostic() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    return m_lastSubmissionDiagnostic;
+}
+
+void GS::setOwnerPumpQueue(GsRenderCommandQueue *queue, bool enabled)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    m_ownerPumpQueue = queue;
+    m_ownerPumpQueueEnabled = (queue != nullptr) && enabled;
+}
+
+void GS::setGpuPointExecutor(std::function<bool(uint32_t, uint32_t &)> executor)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    m_gpuPointExecutor = std::move(executor);
+}
+
+void GS::setFastFstPointSamplingEnabled(bool enabled)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    m_rasterizer.setFastFstPointSamplingEnabled(enabled);
+}
+
+void GS::setSamplerStatsEnabled(bool enabled)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    m_rasterizer.setSamplerStatsEnabled(enabled);
+}
+
+GsSamplerStats GS::samplerStats() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    return m_rasterizer.samplerStats();
+}
+
+void GS::setPixelStateStatsEnabled(bool enabled)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    m_rasterizer.setPixelStateStatsEnabled(enabled);
+}
+
+GsPixelStateStats GS::pixelStateStats() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    return m_rasterizer.pixelStateStats();
+}
+
+void GS::beginOperationUnlocked()
+{
+    if (m_operationSequence != UINT64_MAX)
+        ++m_operationSequence;
+}
+
+void GS::recordVramAccessUnlocked(uint32_t offset, uint32_t sizeBytes, GSVramAccessKind kind) const
+{
+    if (!m_vramAccessTrackingEnabled || m_vramAccessTrackingSuppressed || sizeBytes == 0u ||
+        offset >= m_vramSize)
+        return;
+    const uint64_t end = std::min<uint64_t>(static_cast<uint64_t>(offset) + sizeBytes, m_vramSize);
+    if (end <= offset)
+        return;
+    const size_t first = offset / kVramTrackingGranularity;
+    const size_t last = static_cast<size_t>((end - 1u) / kVramTrackingGranularity);
+    auto &stamps = kind == GSVramAccessKind::Read ? m_vramReadOperationStamps : m_vramWriteOperationStamps;
+    for (size_t block = first; block <= last && block < stamps.size(); ++block)
+    {
+        stamps[block] = m_operationSequence;
+        if (kind == GSVramAccessKind::Write && m_vramBlockVersions[block] != UINT64_MAX)
+            ++m_vramBlockVersions[block];
+    }
+}
+
+std::vector<GSVramByteRange> GS::collectVramOperationRangesUnlocked(uint64_t operationSequence,
+                                                                    GSVramAccessKind kind) const
+{
+    std::vector<GSVramByteRange> ranges;
+    if (!m_vramAccessTrackingEnabled || operationSequence == 0u)
+        return ranges;
+    const auto &stamps = kind == GSVramAccessKind::Read ? m_vramReadOperationStamps : m_vramWriteOperationStamps;
+    size_t block = 0u;
+    while (block < stamps.size())
+    {
+        if (stamps[block] != operationSequence)
+        {
+            ++block;
+            continue;
+        }
+        const size_t first = block;
+        while (block < stamps.size() && stamps[block] == operationSequence)
+            ++block;
+        const size_t begin = first * kVramTrackingGranularity;
+        const size_t end = std::min(block * kVramTrackingGranularity, static_cast<size_t>(m_vramSize));
+        if (end > begin)
+            ranges.push_back({static_cast<uint32_t>(begin), static_cast<uint32_t>(end - begin)});
+    }
+    return ranges;
+}
+
+bool GS::copyVramRangeUnlocked(size_t offset, void *dst, size_t sizeBytes) const
+{
+    if ((!dst && sizeBytes != 0u) || (!m_vram && sizeBytes != 0u) ||
+        offset > m_vramSize || sizeBytes > m_vramSize - offset)
+        return false;
+    if (sizeBytes != 0u)
+    {
+        std::memcpy(dst, m_vram + offset, sizeBytes);
+        recordVramAccessUnlocked(static_cast<uint32_t>(offset), static_cast<uint32_t>(sizeBytes), GSVramAccessKind::Read);
+    }
+    return true;
+}
+
+bool GS::isDiagnosticPointEligible(const GSPrimitiveSubmission &submission) const
+{
+    const GSContext &context = submission.context;
+    return submission.prim.type == GS_PRIM_POINT &&
+           !submission.prim.tme && !submission.prim.abe && !submission.prim.fge &&
+           !submission.prim.aa1 && context.frame.psm == GS_PSM_CT32 &&
+           context.frame.fbmsk == 0u && context.zbuf.zmask &&
+           (context.test & ~(3ull << 16)) == 0u && ((context.test >> 17) & 3u) == 1u &&
+           (context.fba & 1u) == 0u && !submission.dthe && !submission.pabe;
+}
+
+void GS::recordSubmissionDiagnostic(const GSPrimitiveSubmission &submission,
+                                    const std::vector<uint8_t> &beforeVram)
+{
+    GSSubmissionDiagnostic diagnostic{};
+    diagnostic.operationSequence = m_operationSequence;
+    if (!m_vram || beforeVram.size() != m_vramSize || !isDiagnosticPointEligible(submission))
+    {
+        diagnostic.status = GSSubmissionDiagnosticStatus::UnsupportedState;
+        m_lastSubmissionDiagnostic = diagnostic;
+        return;
+    }
+
+    std::vector<uint8_t> actualVram;
+    std::vector<uint8_t> replayVram;
+    try
+    {
+        actualVram.assign(m_vram, m_vram + m_vramSize);
+        replayVram = beforeVram;
+    }
+    catch (...)
+    {
+        diagnostic.status = GSSubmissionDiagnosticStatus::ReplayFailed;
+        m_lastSubmissionDiagnostic = diagnostic;
+        return;
+    }
+
+    uint8_t *const liveVram = m_vram;
+    const bool wasTrackingSuppressed = m_vramAccessTrackingSuppressed;
+    m_vramAccessTrackingSuppressed = true;
+    m_vram = replayVram.data();
+    try
+    {
+        (void)m_rasterizer.drawPrimitive(this, submission);
+    }
+    catch (...)
+    {
+        m_vram = liveVram;
+        m_vramAccessTrackingSuppressed = wasTrackingSuppressed;
+        diagnostic.status = GSSubmissionDiagnosticStatus::ReplayFailed;
+        m_lastSubmissionDiagnostic = diagnostic;
+        return;
+    }
+    m_vram = liveVram;
+    m_vramAccessTrackingSuppressed = wasTrackingSuppressed;
+
+    bool inRange = false;
+    uint32_t rangeStart = 0u;
+    for (uint32_t offset = 0u; offset < m_vramSize; ++offset)
+    {
+        const bool changed = actualVram[offset] != beforeVram[offset];
+        if (changed)
+        {
+            ++diagnostic.changedByteCount;
+            if (!inRange)
+            {
+                inRange = true;
+                rangeStart = offset;
+            }
+        }
+        else if (inRange)
+        {
+            if (diagnostic.writeRangeCount < GSSubmissionDiagnostic::kMaxWriteRanges)
+                diagnostic.writeRanges[diagnostic.writeRangeCount++] = {rangeStart, offset - rangeStart};
+            else
+                diagnostic.writeRangeOverflow = true;
+            inRange = false;
+        }
+
+        if (actualVram[offset] != replayVram[offset])
+            ++diagnostic.mismatchByteCount;
+    }
+    if (inRange)
+    {
+        if (diagnostic.writeRangeCount < GSSubmissionDiagnostic::kMaxWriteRanges)
+            diagnostic.writeRanges[diagnostic.writeRangeCount++] = {rangeStart, m_vramSize - rangeStart};
+        else
+            diagnostic.writeRangeOverflow = true;
+    }
+
+    diagnostic.status = diagnostic.mismatchByteCount == 0u
+                            ? GSSubmissionDiagnosticStatus::Compared
+                            : GSSubmissionDiagnosticStatus::ReplayMismatch;
+    m_lastSubmissionDiagnostic = diagnostic;
 }
 
 void GS::reset()
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    beginOperationUnlocked();
     std::memset(m_ctx, 0, sizeof(m_ctx));
     m_prim = {};
     m_primRegister = {};
@@ -495,6 +866,10 @@ void GS::reset()
         m_hostPresentationUsedPreferred = false;
         m_hasHostPresentationFrame = false;
         m_hostPresentationGeneration = 0u;
+        m_hasLastFramePublicationTime = false;
+        m_frameIntervalWrite = 0;
+        m_frameIntervalCount = 0;
+        m_frameIntervalsDropped = 0;
     }
     m_nativeImageUploadCount = 0;
     m_nativePackedGIFPacketCount = 0;
@@ -515,6 +890,29 @@ void GS::reset()
         m_ctx[i].scissor = {0, 639, 0, 447};
         m_ctx[i].xyoffset = {0, 0};
     }
+}
+
+GSPrimitiveSubmission GS::capturePrimitiveSubmission() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    GSPrimitiveSubmission submission{};
+    submission.context = m_ctx[m_prim.ctxt ? 1 : 0];
+    submission.prim = m_prim;
+    std::copy_n(m_vtxQueue, kMaxVerts, submission.vertices.begin());
+    submission.texa = m_texa;
+    submission.texclut = m_texclut;
+    if (m_prim.tme && isIndexedTexturePsm(submission.context.tex0.psm))
+        submission.clut = m_clut;
+    submission.dimx = m_dimx;
+    submission.dthe = m_dthe;
+    submission.colclamp = m_colclamp;
+    submission.pabe = m_pabe;
+    submission.fogR = m_fogR;
+    submission.fogG = m_fogG;
+    submission.fogB = m_fogB;
+    submission.hasPreferredDisplaySource = m_hasPreferredDisplaySource;
+    submission.preferredDisplayDestFbp = m_preferredDisplayDestFbp;
+    return submission;
 }
 
 GSContext &GS::activeContext()
@@ -629,7 +1027,7 @@ void GS::snapshotVRAM()
         return;
     std::lock_guard<std::mutex> lock(m_snapshotMutex);
     m_displaySnapshot.resize(m_vramSize);
-    std::memcpy(m_displaySnapshot.data(), m_vram, m_vramSize);
+    (void)copyVramRangeUnlocked(0u, m_displaySnapshot.data(), m_vramSize);
 }
 
 const uint8_t *GS::lockDisplaySnapshot(uint32_t &outSize)
@@ -963,6 +1361,8 @@ uint32_t GS::getLastDisplayBaseBytes() const
 
 void GS::refreshDisplaySnapshot()
 {
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    beginOperationUnlocked();
     snapshotVRAM();
 }
 
@@ -1042,11 +1442,13 @@ bool GS::copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
                     return failCopy();
                 }
 
-                dstRow[x * 4u + 0u] = m_vram[srcOff + 0u];
-                dstRow[x * 4u + 1u] = m_vram[srcOff + 1u];
-                dstRow[x * 4u + 2u] = m_vram[srcOff + 2u];
-                dstRow[x * 4u + 3u] =
-                    (preserveAlpha && frame.psm != GS_PSM_CT24) ? m_vram[srcOff + 3u] : 255u;
+                std::array<uint8_t, 4> sourcePixel{};
+                if (!copyVramRangeUnlocked(srcOff, sourcePixel.data(), srcPixelBytes))
+                    return failCopy();
+                dstRow[x * 4u + 0u] = sourcePixel[0];
+                dstRow[x * 4u + 1u] = sourcePixel[1];
+                dstRow[x * 4u + 2u] = sourcePixel[2];
+                dstRow[x * 4u + 3u] = (preserveAlpha && frame.psm != GS_PSM_CT24) ? sourcePixel[3] : 255u;
             }
         }
         return true;
@@ -1098,7 +1500,8 @@ bool GS::copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
                 }
 
                 uint16_t pixel = 0u;
-                std::memcpy(&pixel, m_vram + srcOff, sizeof(pixel));
+                if (!copyVramRangeUnlocked(srcOff, &pixel, sizeof(pixel)))
+                    return failCopy();
                 const uint32_t r = pixel & 31u;
                 const uint32_t g = (pixel >> 5) & 31u;
                 const uint32_t b = (pixel >> 10) & 31u;
@@ -1117,6 +1520,7 @@ bool GS::copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
 void GS::latchHostPresentationFrame()
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    beginOperationUnlocked();
     latchHostPresentationFrameUnlocked();
 }
 
@@ -1132,6 +1536,7 @@ void GS::applyDisplayEnvironment(uint64_t pmode,
         return;
     }
 
+    beginOperationUnlocked();
     // A display-buffer swap is one logical GS operation. Updating these fields
     // individually allowed the host presentation thread to latch a mixture of
     // the old and new environments (for example, DISPFB1 from one buffer and
@@ -1373,6 +1778,24 @@ void GS::publishHostPresentationFrameUnlocked(std::vector<uint8_t> &&pixels,
         m_hostPresentationUsedPreferred = usedPreferred;
         m_hasHostPresentationFrame = true;
         ++m_hostPresentationGeneration;
+        if (m_frameIntervalTelemetryEnabled)
+        {
+            const auto now = std::chrono::steady_clock::now();
+            if (m_hasLastFramePublicationTime)
+            {
+                const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                    now - m_lastFramePublicationTime).count();
+                m_frameIntervalMicroseconds[m_frameIntervalWrite] = static_cast<uint64_t>(
+                    std::max<int64_t>(elapsed, 0));
+                m_frameIntervalWrite = (m_frameIntervalWrite + 1) % GSFrameIntervalSnapshot::Capacity;
+                if (m_frameIntervalCount < GSFrameIntervalSnapshot::Capacity)
+                    ++m_frameIntervalCount;
+                else
+                    ++m_frameIntervalsDropped;
+            }
+            m_lastFramePublicationTime = now;
+            m_hasLastFramePublicationTime = true;
+        }
     }
 
     recordPresentDebugEventUnlocked(displayFbp,
@@ -1458,12 +1881,38 @@ uint64_t GS::hostPresentationGeneration() const
     return m_hostPresentationGeneration;
 }
 
+void GS::setFrameIntervalTelemetryEnabled(bool enabled)
+{
+    std::lock_guard<std::mutex> presentationLock(m_hostPresentationMutex);
+    m_frameIntervalTelemetryEnabled = enabled;
+    m_hasLastFramePublicationTime = false;
+    m_frameIntervalWrite = 0;
+    m_frameIntervalCount = 0;
+    m_frameIntervalsDropped = 0;
+}
+
+GSFrameIntervalSnapshot GS::consumeHostPresentationFrameIntervals()
+{
+    GSFrameIntervalSnapshot snapshot{};
+    std::lock_guard<std::mutex> presentationLock(m_hostPresentationMutex);
+    snapshot.count = m_frameIntervalCount;
+    snapshot.dropped = m_frameIntervalsDropped;
+    const size_t oldest = (m_frameIntervalWrite + GSFrameIntervalSnapshot::Capacity -
+                           m_frameIntervalCount) % GSFrameIntervalSnapshot::Capacity;
+    for (size_t i = 0; i < m_frameIntervalCount; ++i)
+        snapshot.microseconds[i] = m_frameIntervalMicroseconds[(oldest + i) % GSFrameIntervalSnapshot::Capacity];
+    m_frameIntervalCount = 0;
+    m_frameIntervalsDropped = 0;
+    return snapshot;
+}
+
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16 || !m_vram)
         return;
 
+    beginOperationUnlocked();
     ++m_gifPacketCount;
     if (tryProcessNativeImageUploadPacket(data, sizeBytes))
         return;
@@ -1566,6 +2015,7 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
     if (!validatePackedGifPacket(data, sizeBytes))
         return false;
 
+    beginOperationUnlocked();
     ++m_gifPacketCount;
     const bool processed = visitPackedGifPacket(data, sizeBytes, [&](const PackedGifPacketTag &tag)
                                                 {
@@ -1609,6 +2059,7 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
     if (!data || sizeBytes == 0 || !m_vram)
         return;
 
+    beginOperationUnlocked();
     writeRegister(GS_REG_BITBLTBUF, bitbltbuf);
     writeRegister(GS_REG_TRXPOS, trxpos);
     writeRegister(GS_REG_TRXREG, trxreg);
@@ -1874,6 +2325,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
 void GS::writeRegister(uint8_t regAddr, uint64_t value)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    beginOperationUnlocked();
     const bool interestingReg =
         regAddr == GS_REG_PRIM ||
         regAddr == GS_REG_RGBAQ ||
@@ -2513,7 +2965,118 @@ void GS::vertexKick(bool drawing)
 
     if (drawing)
     {
-        m_rasterizer.drawPrimitive(this);
+        const GSPrimitiveSubmission submission = capturePrimitiveSubmission();
+        std::vector<uint8_t> diagnosticBeforeVram;
+        if (m_submissionDiagnosticsEnabled)
+        {
+            m_lastSubmissionDiagnostic = {};
+            m_lastSubmissionDiagnostic.operationSequence = m_operationSequence;
+            m_lastSubmissionDiagnostic.status = GSSubmissionDiagnosticStatus::UnsupportedState;
+            if (isDiagnosticPointEligible(submission))
+            {
+                try
+                {
+                    diagnosticBeforeVram.assign(m_vram, m_vram + m_vramSize);
+                }
+                catch (...)
+                {
+                    m_lastSubmissionDiagnostic.status = GSSubmissionDiagnosticStatus::ReplayFailed;
+                }
+            }
+        }
+
+        GSPrimitiveEffects effects{};
+        bool gpuPointCommitted = false;
+        if (m_gpuPointExecutor && isDiagnosticPointEligible(submission) &&
+            submission.vertices[0].a == 0xFFu)
+        {
+            const GSContext &context = submission.context;
+            const GSVertex &vertex = submission.vertices[0];
+            const int x = static_cast<int>(vertex.x) - (context.xyoffset.ofx >> 4);
+            const int y = static_cast<int>(vertex.y) - (context.xyoffset.ofy >> 4);
+            if (x >= static_cast<int>(context.scissor.x0) &&
+                x <= static_cast<int>(context.scissor.x1) &&
+                y >= static_cast<int>(context.scissor.y0) &&
+                y <= static_cast<int>(context.scissor.y1))
+            {
+                const uint32_t fbw = std::max<uint32_t>(context.frame.fbw, 1u);
+                const uint32_t fbp = GSInternal::framePageBaseToBlock(context.frame.fbp);
+                const uint32_t offset = GSPSMCT32::addrPSMCT32(
+                    fbp, fbw, static_cast<uint32_t>(x), static_cast<uint32_t>(y));
+                if (offset <= m_vramSize && sizeof(uint32_t) <= m_vramSize - offset)
+                {
+                    const uint32_t input = static_cast<uint32_t>(vertex.r) |
+                        (static_cast<uint32_t>(vertex.g) << 8u) |
+                        (static_cast<uint32_t>(vertex.b) << 16u) |
+                        (static_cast<uint32_t>(vertex.a) << 24u);
+                    uint32_t result = 0u;
+                    try
+                    {
+                        gpuPointCommitted = m_gpuPointExecutor(input, result) && result == input;
+                    }
+                    catch (...)
+                    {
+                        gpuPointCommitted = false;
+                    }
+                    if (gpuPointCommitted)
+                    {
+                        WriteVram(GS_PSM_CT32, fbp, fbw,
+                                  static_cast<uint32_t>(x), static_cast<uint32_t>(y), result);
+                        effects.clearPreferredDisplaySource =
+                            submission.hasPreferredDisplaySource &&
+                            context.frame.fbp == submission.preferredDisplayDestFbp;
+                    }
+                }
+            }
+        }
+        if (!gpuPointCommitted)
+            effects = m_rasterizer.drawPrimitive(this, submission);
+        if (m_ownerPumpQueueEnabled && m_ownerPumpQueue && isDiagnosticPointEligible(submission))
+        {
+            const GSContext &context = submission.context;
+            const GSVertex &vertex = submission.vertices[0];
+            const int x = static_cast<int>(vertex.x) - (context.xyoffset.ofx >> 4);
+            const int y = static_cast<int>(vertex.y) - (context.xyoffset.ofy >> 4);
+            if (x >= static_cast<int>(context.scissor.x0) &&
+                x <= static_cast<int>(context.scissor.x1) &&
+                y >= static_cast<int>(context.scissor.y0) &&
+                y <= static_cast<int>(context.scissor.y1))
+            {
+                const uint32_t fbw = std::max<uint32_t>(context.frame.fbw, 1u);
+                const uint32_t fbp = GSInternal::framePageBaseToBlock(context.frame.fbp);
+                const uint32_t destination =
+                    GSPSMCT32::addrPSMCT32(fbp, fbw, static_cast<uint32_t>(x), static_cast<uint32_t>(y));
+                if (destination <= m_vramSize && sizeof(uint32_t) <= m_vramSize - destination)
+                {
+                    const uint32_t color = ReadVram(GS_PSM_CT32, fbp, fbw,
+                                                    static_cast<uint32_t>(x), static_cast<uint32_t>(y));
+                    std::array<uint8_t, GS_POINT_JOB_V1_SIZE> payload{};
+                    if (encodeGsPointJobV1({m_operationSequence, destination, color}, payload))
+                    {
+                        // The CPU draw above is authoritative. This optional
+                        // shadow command must never block while GS state is
+                        // locked; a full/failed queue simply keeps the CPU result.
+                        try
+                        {
+                            (void)m_ownerPumpQueue->trySubmit(payload.data(), payload.size());
+                        }
+                        catch (...)
+                        {
+                        }
+                    }
+                }
+            }
+        }
+        if (m_submissionDiagnosticsEnabled && diagnosticBeforeVram.size() == m_vramSize && !diagnosticBeforeVram.empty())
+            recordSubmissionDiagnostic(submission, diagnosticBeforeVram);
+        if (effects.clearPreferredDisplaySource)
+            m_hasPreferredDisplaySource = false;
+        if (effects.setPreferredDisplaySource)
+        {
+            m_preferredDisplaySourceFrame = effects.preferredDisplaySourceFrame;
+            m_preferredDisplayDestFbp = effects.preferredDisplayDestFbp;
+            m_hasPreferredDisplaySource = true;
+        }
         recordDrawDebugEventUnlocked(needed);
     }
 
@@ -2579,7 +3142,7 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
             u32 c;
             std::memcpy(&c, &data[data_offset], sizeof(u32));
 
-            GSMem::WriteCT32(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c);
+            WriteVram(GS_PSM_CT32, dbp, dbw, m_transferState.x, m_transferState.y, c);
 
             m_transferState.x++;
             m_transferState.copied_pixels++;
@@ -2607,7 +3170,7 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
             u32 c;
             std::memcpy(&c, &data[data_offset], sizeof(u32));
 
-            GSMem::WriteZ32(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c);
+            WriteVram(GS_PSM_Z32, dbp, dbw, m_transferState.x, m_transferState.y, c);
 
             m_transferState.x++;
             m_transferState.copied_pixels++;
@@ -2635,7 +3198,7 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
             u32 c;
             std::memcpy(&c, &data[data_offset], sizeof(u32));
 
-            GSMem::WriteCT24(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c);
+            WriteVram(GS_PSM_CT24, dbp, dbw, m_transferState.x, m_transferState.y, c);
 
             m_transferState.x++;
             m_transferState.copied_pixels++;
@@ -2663,7 +3226,7 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
             u32 c;
             std::memcpy(&c, &data[data_offset], sizeof(u32));
 
-            GSMem::WriteZ24(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c);
+            WriteVram(GS_PSM_Z24, dbp, dbw, m_transferState.x, m_transferState.y, c);
 
             m_transferState.x++;
             m_transferState.copied_pixels++;
@@ -2691,7 +3254,7 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
             u16 c;
             std::memcpy(&c, &data[data_offset], sizeof(u16));
 
-            GSMem::WriteCT16(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c);
+            WriteVram(GS_PSM_CT16, dbp, dbw, m_transferState.x, m_transferState.y, c);
 
             m_transferState.x++;
             m_transferState.copied_pixels++;
@@ -2719,7 +3282,7 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
             u16 c;
             std::memcpy(&c, &data[data_offset], sizeof(u16));
 
-            GSMem::WriteZ16(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c);
+            WriteVram(GS_PSM_Z16, dbp, dbw, m_transferState.x, m_transferState.y, c);
 
             m_transferState.x++;
             m_transferState.copied_pixels++;
@@ -2747,7 +3310,7 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
             u16 c;
             std::memcpy(&c, &data[data_offset], sizeof(u16));
 
-            GSMem::WriteCT16S(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c);
+            WriteVram(GS_PSM_CT16S, dbp, dbw, m_transferState.x, m_transferState.y, c);
 
             m_transferState.x++;
             m_transferState.copied_pixels++;
@@ -2775,7 +3338,7 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
             u16 c;
             std::memcpy(&c, &data[data_offset], sizeof(u16));
 
-            GSMem::WriteZ16S(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c);
+            WriteVram(GS_PSM_Z16S, dbp, dbw, m_transferState.x, m_transferState.y, c);
 
             m_transferState.x++;
             m_transferState.copied_pixels++;
@@ -2802,7 +3365,7 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
         {
             u8 c = data[data_offset];
 
-            GSMem::WriteP8(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c);
+            WriteVram(GS_PSM_T8, dbp, dbw, m_transferState.x, m_transferState.y, c);
 
             m_transferState.x++;
             m_transferState.copied_pixels++;
@@ -2829,7 +3392,7 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
         {
             u8 c = data[data_offset];
 
-            GSMem::WriteP8H(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c);
+            WriteVram(GS_PSM_T8H, dbp, dbw, m_transferState.x, m_transferState.y, c);
 
             m_transferState.x++;
             m_transferState.copied_pixels++;
@@ -2856,8 +3419,8 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
             u8 c0 = data[data_offset] & 0xF;
             u8 c1 = (data[data_offset] >> 4) & 0xF;
 
-            GSMem::WriteP4(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c0);
-            GSMem::WriteP4(m_vram, dbp, dbw, m_transferState.x + 1, m_transferState.y, c1);
+            WriteVram(GS_PSM_T4, dbp, dbw, m_transferState.x, m_transferState.y, c0);
+            WriteVram(GS_PSM_T4, dbp, dbw, m_transferState.x + 1, m_transferState.y, c1);
 
             m_transferState.x += 2;
             m_transferState.copied_pixels += 2;
@@ -2884,8 +3447,8 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
             u8 c0 = data[data_offset] & 0xF;
             u8 c1 = (data[data_offset] >> 4) & 0xF;
 
-            GSMem::WriteP4HL(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c0);
-            GSMem::WriteP4HL(m_vram, dbp, dbw, m_transferState.x + 1, m_transferState.y, c1);
+            WriteVram(GS_PSM_T4HL, dbp, dbw, m_transferState.x, m_transferState.y, c0);
+            WriteVram(GS_PSM_T4HL, dbp, dbw, m_transferState.x + 1, m_transferState.y, c1);
 
             m_transferState.x += 2;
             m_transferState.copied_pixels += 2;
@@ -2912,8 +3475,8 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
             u8 c0 = data[data_offset] & 0xF;
             u8 c1 = (data[data_offset] >> 4) & 0xF;
 
-            GSMem::WriteP4HH(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c0);
-            GSMem::WriteP4HH(m_vram, dbp, dbw, m_transferState.x + 1, m_transferState.y, c1);
+            WriteVram(GS_PSM_T4HH, dbp, dbw, m_transferState.x, m_transferState.y, c0);
+            WriteVram(GS_PSM_T4HH, dbp, dbw, m_transferState.x + 1, m_transferState.y, c1);
 
             m_transferState.x += 2;
             m_transferState.copied_pixels += 2;
@@ -3007,12 +3570,14 @@ void GS::performLocalToHostToBuffer()
 bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    beginOperationUnlocked();
     return clearFramebufferRect(this, m_ctx[(contextIndex != 0u) ? 1 : 0], rgba);
 }
 
 bool GS::clearActiveFramebuffer(uint32_t rgba)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    beginOperationUnlocked();
     return clearFramebufferRect(this, activeContext(), rgba);
 }
 
@@ -3025,6 +3590,7 @@ uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
     if (avail == 0)
         return 0;
     size_t toCopy = (avail < maxBytes) ? avail : static_cast<size_t>(maxBytes);
+    beginOperationUnlocked();
     std::memcpy(dst, m_localToHostBuffer.data() + m_localToHostReadPos, toCopy);
     m_localToHostReadPos += toCopy;
     return static_cast<uint32_t>(toCopy);

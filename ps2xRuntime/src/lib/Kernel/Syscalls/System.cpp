@@ -11,6 +11,7 @@ namespace ps2_syscalls
 
         if (runtime)
         {
+            (void)runtime->gs(); // Fence queued GIF writes before guest-visible register access.
             auto &gs = runtime->memory().gs();
             const uint64_t smode2 =
                 (static_cast<uint64_t>(interlaced) & 0x1ull) |
@@ -42,6 +43,7 @@ namespace ps2_syscalls
         uint64_t imr = 0;
         if (runtime)
         {
+            (void)runtime->gs();
             imr = runtime->memory().gs().imr;
         }
 
@@ -64,6 +66,7 @@ namespace ps2_syscalls
         uint64_t oldImr = 0;
         if (runtime)
         {
+            (void)runtime->gs();
             oldImr = runtime->memory().gs().imr;
             runtime->memory().gs().imr = newImr;
         }

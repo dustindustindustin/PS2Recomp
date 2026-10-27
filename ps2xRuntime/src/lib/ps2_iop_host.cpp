@@ -219,6 +219,12 @@ void PS2IopHostAdapter::freeGuest(uint32_t address)
     m_runtime.guestFree(address);
 }
 
+void PS2IopHostAdapter::resetAudio(uint32_t sid)
+{
+    if (sid == 0x05730601u)
+        m_runtime.audioBackend().onDuelistsAutoDma(nullptr, 0xffffu, nullptr, 0u, nullptr, 0u);
+}
+
 void PS2IopHostAdapter::audioCommand(uint32_t sid,
                                      uint32_t function,
                                      ps2x::iop::GuestBuffer send,
@@ -233,6 +239,12 @@ void PS2IopHostAdapter::audioCommand(uint32_t sid,
     if (receive.address && !guestRange(receive.address, receive.size, receivePointer))
     {
         receivePointer = nullptr;
+    }
+    if (sid == 0x05730601u) {
+        m_runtime.audioBackend().onDuelistsAutoDma(
+            m_activeRdram ? m_activeRdram : m_runtime.memory().getRDRAM(),
+            function, sendPointer, send.size, receivePointer, receive.size);
+        return;
     }
     m_runtime.audioBackend().onSoundCommand(sid,
                                             function,

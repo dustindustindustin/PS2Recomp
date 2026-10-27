@@ -2,6 +2,26 @@ cmake_minimum_required(VERSION 3.21)
 
 project(ps2xTest LANGUAGES C CXX)
 
+# Isolated raylib input stub verifies press/release events within one poll.
+add_executable(ps2x_pad_keyboard_regression
+    src/pad_backend_keyboard_regression.cpp
+    ../ps2xRuntime/src/lib/ps2_pad.cpp)
+target_include_directories(ps2x_pad_keyboard_regression PRIVATE
+    ${CMAKE_SOURCE_DIR}/ps2xRuntime/include)
+target_link_libraries(ps2x_pad_keyboard_regression PRIVATE raylib)
+add_test(NAME ps2x_pad_keyboard_regression COMMAND ps2x_pad_keyboard_regression)
+
+# Deterministic stream device verifies real backend output and consumption.
+get_target_property(PS2X_AUDIO_TEST_RAYLIB_INCLUDES raylib INTERFACE_INCLUDE_DIRECTORIES)
+add_executable(ps2x_audio_autodma_regression
+    src/audio_backend_autodma_regression.cpp
+    ../ps2xRuntime/src/lib/ps2_audio.cpp
+    ../ps2xRuntime/src/lib/ps2_audio_vag.cpp)
+target_compile_features(ps2x_audio_autodma_regression PRIVATE cxx_std_20)
+target_include_directories(ps2x_audio_autodma_regression PRIVATE
+    ${CMAKE_SOURCE_DIR}/ps2xRuntime/include ${PS2X_AUDIO_TEST_RAYLIB_INCLUDES})
+add_test(NAME ps2x_audio_autodma_regression COMMAND ps2x_audio_autodma_regression)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -54,6 +74,11 @@ add_library(ps2_test_lib STATIC
     src/ps2_vu1_tests.cpp
     src/ps2_vu_tests.cpp
     src/ps2_gs_tests.cpp
+    src/ps2_gs_reference_tests.cpp
+    src/ps2_gs_reference_raster_tests.cpp
+    src/ps2_gs_reference_texture_tests.cpp
+    src/ps2_gs_render_queue_tests.cpp
+    src/ps2_frame_upload_tests.cpp
     src/ps2_iop_tests.cpp
     src/ps2_sif_rpc_tests.cpp
     src/ps2_sif_dma_tests.cpp
@@ -95,6 +120,26 @@ add_executable(ps2x_tests
     src/main.cpp
     $<TARGET_OBJECTS:ps2_test_function_table>
 )
+
+# Headless synthetic throughput check; no copyrighted game data required.
+add_executable(ps2x_vu_benchmark src/vu_benchmark.cpp
+    $<TARGET_OBJECTS:ps2_test_function_table>)
+target_include_directories(ps2x_vu_benchmark PRIVATE ${CMAKE_SOURCE_DIR}/ps2xRuntime/include)
+target_link_libraries(ps2x_vu_benchmark PRIVATE ps2_runtime)
+
+# Synthetic GS triangle A/B with byte-for-byte VRAM comparison.
+add_executable(ps2x_gs_triangle_benchmark src/gs_triangle_benchmark.cpp
+    $<TARGET_OBJECTS:ps2_test_function_table>)
+target_include_directories(ps2x_gs_triangle_benchmark PRIVATE ${CMAKE_SOURCE_DIR}/ps2xRuntime/include)
+target_link_libraries(ps2x_gs_triangle_benchmark PRIVATE ps2_runtime)
+if(COMMAND ps2x_stage_ffmpeg_runtime_dlls)
+    ps2x_stage_ffmpeg_runtime_dlls(ps2x_vu_benchmark)
+endif()
+
+# Headless measurement of the host frame's dirty-tile upload planner.
+add_executable(ps2x_frame_upload_benchmark src/frame_upload_benchmark.cpp)
+target_include_directories(ps2x_frame_upload_benchmark PRIVATE
+    ${CMAKE_SOURCE_DIR}/ps2xRuntime/include)
 
 option(PRINT_GENERATED_CODE "Print generated code in tests" OFF)
 if(PRINT_GENERATED_CODE)

@@ -306,8 +306,7 @@ void register_ps2_runtime_interrupt_tests()
             constexpr uint32_t kIterations = 80000u;
 
             GS gs;
-            gs.init(env.runtime.memory().getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE),
-                    &env.runtime.memory().gs());
+            env.runtime.memory().bindGS(gs);
 
             // Drive the real vsync worker via the same syscall path production
             // code uses; it runs on its own thread and toggles CSR.FIELD once

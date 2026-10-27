@@ -326,8 +326,8 @@ namespace
         GS gs;
         gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
 
-        gs.WriteVram(framePsm, kFrameBlock, 1u, 0u, 0u, initialFramebuffer);
-        gs.WriteVram(GS_PSM_Z32, kDepthBlock, 1u, 0u, 0u, initialDepth);
+        gs.writeVramPixel(framePsm, kFrameBlock, 1u, 0u, 0u, initialFramebuffer);
+        gs.writeVramPixel(GS_PSM_Z32, kDepthBlock, 1u, 0u, 0u, initialDepth);
 
         const uint64_t frame =
             (1ull << 16) |
@@ -351,16 +351,237 @@ namespace
         gs.writeRegister(GS_REG_XYZ2, static_cast<uint64_t>(kSourceDepth) << 32);
 
         return {
-            gs.ReadVram(framePsm, kFrameBlock, 1u, 0u, 0u),
-            gs.ReadVram(GS_PSM_Z32, kDepthBlock, 1u, 0u, 0u),
+            gs.readVramPixel(framePsm, kFrameBlock, 1u, 0u, 0u),
+            gs.readVramPixel(GS_PSM_Z32, kDepthBlock, 1u, 0u, 0u),
         };
     }
+}
+
+static uint64_t renderSoftwareGsReferenceHash()
+{
+    std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+    GS gs;
+    gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+    gs.writeRegister(GS_REG_FRAME_1,
+                     (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+    gs.writeRegister(GS_REG_ZBUF_1, 1ull << 32);
+    gs.writeRegister(GS_REG_SCISSOR_1, (7ull << 16) | (7ull << 48));
+    gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+    gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+    gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_POINT));
+
+    for (uint32_t y = 0; y < 8u; ++y)
+    {
+        for (uint32_t x = 0; x < 8u; ++x)
+        {
+            const uint32_t r = x * 31u + 7u;
+            const uint32_t g = y * 29u + 11u;
+            const uint32_t b = (x * 13u + y * 17u) & 0xFFu;
+            const uint64_t rgbaq = 0xFF000000ull | (static_cast<uint64_t>(b) << 16) |
+                                   (static_cast<uint64_t>(g) << 8) | r;
+            const uint64_t xyz = static_cast<uint64_t>(x * 16u) |
+                                 (static_cast<uint64_t>(y * 16u) << 16);
+            gs.writeRegister(GS_REG_RGBAQ, rgbaq);
+            gs.writeRegister(GS_REG_XYZ2, xyz);
+        }
+    }
+
+    // FNV-1a over logical framebuffer words, avoiding unrelated VRAM padding.
+    uint64_t hash = 14695981039346656037ull;
+    for (uint32_t y = 0; y < 8u; ++y)
+    {
+        for (uint32_t x = 0; x < 8u; ++x)
+        {
+            const uint32_t pixel = gs.readVramPixel(GS_PSM_CT32, 0u, 1u, x, y);
+            for (uint32_t byte = 0; byte < 4u; ++byte)
+            {
+                hash ^= (pixel >> (byte * 8u)) & 0xFFu;
+                hash *= 1099511628211ull;
+            }
+        }
+    }
+    return hash;
 }
 
 void register_ps2_gs_tests()
 {
     MiniTest::Case("PS2GS", [](TestCase &tc)
     {
+        tc.Run("software GS produces a stable framebuffer reference image", [](TestCase &t)
+        {
+            const uint64_t first = renderSoftwareGsReferenceHash();
+            const uint64_t second = renderSoftwareGsReferenceHash();
+            t.Equals(first, second,
+                     "identical synthetic GS command streams should produce identical framebuffer pixels");
+            // This constant is the compact CPU-reference oracle for backend
+            // differential tests; update only alongside an intentional GS
+            // correctness change and review of the generated pixel output.
+            t.Equals(first, 0x87FFA49F4A65E8B5ull,
+                     "software GS reference image hash should match its checked-in oracle");
+        });
+
+        tc.Run("opt-in submission diagnostic replays a supported point draw exactly", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            t.Equals(gs.lastSubmissionDiagnostic().status, GSSubmissionDiagnosticStatus::Disabled,
+                     "submission replay diagnostics should start disabled");
+            gs.setSubmissionDiagnosticsEnabled(true);
+            gs.writeRegister(GS_REG_FRAME_1,
+                             (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+            gs.writeRegister(GS_REG_ZBUF_1, 1ull << 32);
+            gs.writeRegister(GS_REG_SCISSOR_1, 0ull);
+            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            // TEST ZTST=ALWAYS and ZTE enabled satisfy the current software
+            // rasterizer's explicit depth-pass contract without enabling
+            // alpha or destination-alpha tests.
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(GS_REG_PRMODECONT, 1ull);
+            gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_POINT));
+            gs.writeRegister(GS_REG_RGBAQ, 0xFF123456ull);
+            gs.writeRegister(GS_REG_XYZ2, 0ull);
+
+            const GSSubmissionDiagnostic diagnostic = gs.lastSubmissionDiagnostic();
+            t.Equals(diagnostic.status, GSSubmissionDiagnosticStatus::Compared,
+                     "the replay should exactly match a supported CT32 point draw");
+            t.Equals(diagnostic.mismatchByteCount, 0u,
+                     "the isolated replay should produce no byte differences");
+            t.Equals(diagnostic.changedByteCount, 4u,
+                     "the point should change exactly its four CT32 color bytes (actual=" +
+                         std::to_string(diagnostic.changedByteCount) + ")");
+            t.Equals(diagnostic.writeRangeCount, 1u,
+                     "the point write should be described by one bounded byte range (actual=" +
+                         std::to_string(diagnostic.writeRangeCount) + ")");
+            t.IsFalse(diagnostic.writeRangeOverflow,
+                      "one point write must fit within the bounded range report");
+            t.Equals(diagnostic.operationSequence, gs.operationSequence(),
+                     "diagnostic metadata should identify the GS operation that drew the point");
+            const uint32_t livePixel = gs.readVramPixel(GS_PSM_CT32, 0u, 1u, 0u, 0u);
+            t.Equals(livePixel, 0xFF123456u,
+                     "diagnostic replay must leave the live framebuffer output unchanged (actual=" +
+                         std::to_string(livePixel) + ")");
+
+            gs.setSubmissionDiagnosticsEnabled(false);
+            t.Equals(gs.lastSubmissionDiagnostic().status, GSSubmissionDiagnosticStatus::Disabled,
+                     "turning diagnostics off should clear their retained result");
+        });
+
+        tc.Run("rasterizer replays captured primitive state after live GS state advances", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            gs.writeRegister(GS_REG_FRAME_1,
+                             (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+            gs.writeRegister(GS_REG_ZBUF_1, 1ull << 32);
+            gs.writeRegister(GS_REG_SCISSOR_1, (7ull << 16) | (7ull << 48));
+            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_POINT));
+            gs.writeRegister(GS_REG_RGBAQ, 0xFF112233ull);
+            gs.writeRegister(GS_REG_XYZ2, 1ull * 16u | (2ull * 16u << 16));
+            const GSPrimitiveSubmission submission = gs.capturePrimitiveSubmission();
+
+            // Change the live GS context and vertex/color, then erase the
+            // original pixel so replay can only pass if it uses the snapshot.
+            gs.writeVramPixel(GS_PSM_CT32, 0u, 1u, 1u, 2u, 0u);
+            gs.writeRegister(GS_REG_FRAME_1,
+                             (150ull) | (1ull << 16) |
+                                 (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+            gs.writeRegister(GS_REG_RGBAQ, 0xFFABCDEFu);
+            gs.writeRegister(GS_REG_XYZ2, 4ull * 16u | (5ull * 16u << 16));
+
+            GSRasterizer rasterizer;
+            (void)rasterizer.drawPrimitive(&gs, submission);
+            t.Equals(gs.readVramPixel(GS_PSM_CT32, 0u, 1u, 1u, 2u), 0xFF112233u,
+                     "replay should use the captured framebuffer, vertex, and color after live state changes");
+            t.Equals(gs.readVramPixel(GS_PSM_CT32, 150u << 5u, 1u, 4u, 5u), 0xFFABCDEFu,
+                     "captured replay should leave the newer live GS draw intact");
+        });
+
+        tc.Run("opt-in triangle pixel-state counters distinguish pipeline outcomes", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            GSRasterizer rasterizer;
+            GSPrimitiveSubmission submission{};
+            submission.prim.type = GS_PRIM_TRIANGLE;
+            submission.context.frame = {0u, 1u, GS_PSM_CT32, 0u};
+            submission.context.scissor = {0u, 7u, 0u, 7u};
+            submission.context.zbuf = {1u, GS_PSM_Z32, true};
+            submission.context.test = 0x30000ull; // ZTST=ALWAYS.
+            constexpr int x = 2;
+            constexpr int y = 3;
+            const auto pixel = [&]()
+            {
+                rasterizer.writePixel(&gs, submission, x, y, 1, 0x12u, 0x34u, 0x56u, 0x7Fu, 0u);
+            };
+
+            pixel();
+            t.Equals(rasterizer.pixelStateStats().coveredPixels, 0ull,
+                     "disabled diagnostics must leave counters untouched");
+            rasterizer.setPixelStateStatsEnabled(true);
+            pixel(); // Plain framebuffer write; ZMSK suppresses depth write.
+
+            submission.context.test = 0x30001ull; // ATE=1, ATST=NEVER, AFAIL=KEEP.
+            pixel();
+
+            submission.context.test = 0x70000ull; // ZTST=GREATER.
+            gs.writeVramPixel(GS_PSM_Z32, 1u << 5u, 1u, x, y, 100u);
+            pixel();
+
+            submission.context.test = 0x3C000ull; // DATE=1, DATM=1, ZTST=ALWAYS.
+            gs.writeVramPixel(GS_PSM_CT32, 0u, 1u, x, y, 0u);
+            pixel();
+
+            submission.context.test = 0x30000ull;
+            submission.context.frame.fbmsk = 0x00FF0000u;
+            submission.context.zbuf.zmask = false;
+            pixel(); // Read/modify/write framebuffer and write depth.
+
+            const GsPixelStateStats stats = rasterizer.pixelStateStats();
+            t.Equals(stats.coveredPixels, 5ull, "all five in-scissor triangle pixels should be counted");
+            t.Equals(stats.framePsm[GS_PSM_CT32], 5ull, "frame PSM histogram should cover each pixel");
+            t.Equals(stats.depthPsm[GS_PSM_Z32], 5ull, "depth PSM histogram should cover each pixel");
+            t.Equals(stats.ztst[1], 4ull, "ALWAYS ZTST should cover four pixels");
+            t.Equals(stats.ztst[3], 1ull, "GREATER ZTST should cover one pixel");
+            t.Equals(stats.zmask[1], 4ull, "ZMSK should be counted before the write outcome");
+            t.Equals(stats.zmask[0], 1ull, "unmasked depth state should cover the final pixel");
+            t.Equals(stats.alphaTest[1], 1ull, "ATE should cover only the alpha-rejected pixel");
+            t.Equals(stats.date[1], 1ull, "DATE should cover only its rejected pixel");
+            t.Equals(stats.fbmsk[1], 1ull, "FBMSK should cover only the final pixel");
+            t.Equals(stats.untextured, 5ull, "untextured state should classify each pixel");
+            t.Equals(stats.alphaRejected, 1ull, "alpha-test failure should be counted");
+            t.Equals(stats.alphaDiscarded, 1ull, "AFAIL=KEEP should discard one pixel");
+            t.Equals(stats.dateRejected, 1ull, "destination-alpha test should reject one pixel");
+            t.Equals(stats.depthRejected, 1ull, "depth test should reject one pixel");
+            t.Equals(stats.framebufferReads, 2ull, "DATE and FBMSK should each read framebuffer");
+            t.Equals(stats.depthReads, 1ull, "GREATER should read one depth value");
+            t.Equals(stats.framebufferWrites, 2ull, "plain and masked pixels should write framebuffer");
+            t.Equals(stats.depthWrites, 1ull, "only the unmasked passing pixel should write depth");
+
+            rasterizer.setPixelStateStatsEnabled(false);
+            t.Equals(rasterizer.pixelStateStats().coveredPixels, 0ull,
+                     "disabling counters should clear prior diagnostic totals");
+            rasterizer.setPixelStateStatsEnabled(true);
+            submission.prim.type = GS_PRIM_POINT;
+            pixel();
+            t.Equals(rasterizer.pixelStateStats().coveredPixels, 0ull,
+                     "point writes should not appear in triangle coverage");
+            submission.prim.type = GS_PRIM_TRIANGLE;
+            submission.prim.tme = true;
+            submission.context.tex0.psm = GS_PSM_T8;
+            pixel();
+            t.Equals(rasterizer.pixelStateStats().texturePsm[GS_PSM_T8], 1ull,
+                     "textured triangle coverage should classify source PSM");
+            t.Equals(rasterizer.pixelStateStats().untextured, 0ull,
+                     "textured triangle coverage should not count as untextured");
+        });
+
         tc.Run("GS CSR/IMR support coherent 64-bit and 32-bit access", [](TestCase &t)
         {
             PS2Memory mem;
@@ -562,7 +783,8 @@ void register_ps2_gs_tests()
             std::memset(rdram.data() + kEnvAddr, 0xCD, kDBuffSize);
             std::memcpy(rdram.data() + kStackAddr + 16u, &kZTest, sizeof(kZTest));
             std::memcpy(rdram.data() + kStackAddr + 24u, &kEnableClear, sizeof(kEnableClear));
-            std::memset(runtime.memory().getGSVRAM(), 0xAB, 16u);
+            runtime.memory().bindGS(runtime.gs());
+            runtime.gs().fillVramBytes(0u, 0xABu, 16u);
             ps2_stubs::sceGsSetDefDBuffDc(rdram.data(), &ctx, &runtime);
 
             uint64_t testAAddr = 0u;
@@ -594,7 +816,7 @@ void register_ps2_gs_tests()
             ps2_stubs::sceGsSwapDBuffDc(rdram.data(), &ctx, &runtime);
 
             uint32_t clearedPixel = 0u;
-            std::memcpy(&clearedPixel, runtime.memory().getGSVRAM(), sizeof(clearedPixel));
+            runtime.gs().copyVramBytes(0u, &clearedPixel, sizeof(clearedPixel));
             t.Equals(clearedPixel, kClearColor,
                      "sceGsSwapDBuffDc should execute the seeded clear packet against the active draw buffer");
 
@@ -602,7 +824,7 @@ void register_ps2_gs_tests()
             constexpr uint32_t kMidY = 200u;
             const uint32_t kMidOffset = ((kMidY * 640u) + kMidX) * 4u;
             uint32_t clearedMidPixel = 0u;
-            std::memcpy(&clearedMidPixel, runtime.memory().getGSVRAM() + kMidOffset, sizeof(clearedMidPixel));
+            runtime.gs().copyVramBytes(kMidOffset, &clearedMidPixel, sizeof(clearedMidPixel));
             t.Equals(clearedMidPixel, kClearColor,
                      "sceGsSwapDBuffDc should clear the interior of the active draw buffer, not just the first pixel");
         });
@@ -631,7 +853,8 @@ void register_ps2_gs_tests()
             setRegU32(ctx, 10, 1u);
             setRegU32(ctx, 29, kStackAddr);
             std::memset(rdram.data() + kEnvAddr, 0xCD, kDBuffSize);
-            std::memset(runtime.memory().getGSVRAM(), 0xAB, 16u);
+            runtime.memory().bindGS(runtime.gs());
+            runtime.gs().fillVramBytes(0u, 0xABu, 16u);
 
             ps2_stubs::sceGsSetDefDBuffDc(rdram.data(), &ctx, &runtime);
 
@@ -649,7 +872,7 @@ void register_ps2_gs_tests()
             ps2_stubs::sceGsSwapDBuffDc(rdram.data(), &ctx, &runtime);
 
             uint32_t clearedPixel = 0u;
-            std::memcpy(&clearedPixel, runtime.memory().getGSVRAM(), sizeof(clearedPixel));
+            runtime.gs().copyVramBytes(0u, &clearedPixel, sizeof(clearedPixel));
             t.Equals(clearedPixel, kClearColor,
                      "sceGsSwapDBuffDc should honor a clear packet seeded from register-based trailing args");
         });
@@ -1704,6 +1927,7 @@ void register_ps2_gs_tests()
 
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
+            gs.setFrameIntervalTelemetryEnabled(true);
 
             constexpr uint32_t kDisplayPixel = 0x00332211u;
             constexpr uint32_t kSourcePixel = 0x00665544u;
@@ -1772,6 +1996,8 @@ void register_ps2_gs_tests()
             const uint64_t firstGeneration = gs.hostPresentationGeneration();
             t.IsTrue(firstGeneration > 0u,
                      "a successful latch should publish a nonzero frame generation");
+            t.Equals(gs.consumeHostPresentationFrameIntervals().count, size_t{0},
+                     "the first published frame should establish the timing origin without an interval");
 
             std::vector<uint8_t> latchedFrame;
             uint32_t latchedWidth = 0u;
@@ -1820,6 +2046,15 @@ void register_ps2_gs_tests()
             gs.latchHostPresentationFrame();
             t.Equals(gs.hostPresentationGeneration(), firstGeneration + 1u,
                      "the next completed latch should advance the published generation exactly once");
+            const GSFrameIntervalSnapshot intervals = gs.consumeHostPresentationFrameIntervals();
+            t.Equals(intervals.count, size_t{1},
+                     "a second published frame should produce exactly one guest interval");
+            t.Equals(intervals.dropped, uint64_t{0},
+                     "normal guest frame timing should not overflow the bounded ring");
+            t.IsTrue(intervals.microseconds[0] > 0u,
+                     "a guest publication interval should use the steady clock");
+            t.Equals(gs.consumeHostPresentationFrameIntervals().count, size_t{0},
+                     "consuming the timing snapshot should clear its pending samples");
 
             std::vector<uint8_t> refreshedFrame;
             uint32_t refreshedWidth = 0u;
@@ -1828,6 +2063,10 @@ void register_ps2_gs_tests()
                      "latched host presentation should refresh after a new latch");
             t.Equals(static_cast<uint32_t>(refreshedFrame[0]), 0x77u,
                      "relatching should pick up the updated source frame contents");
+            gs.setFrameIntervalTelemetryEnabled(false);
+            gs.latchHostPresentationFrame();
+            t.Equals(gs.consumeHostPresentationFrameIntervals().count, size_t{0},
+                     "disabled telemetry should not record publication intervals");
         });
 
         tc.Run("latched host presentation frame is returned tightly packed for narrower display widths", [](TestCase &t)
@@ -2519,10 +2758,10 @@ void register_ps2_gs_tests()
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
 
-            t.Equals(gs.ReadVram(0x3Fu, 0u, 1u, 0u, 0u), 0u,
+            t.Equals(gs.readVramPixel(0x3Fu, 0u, 1u, 0u, 0u), 0u,
                      "reserved PSM reads should use the null handler");
 
-            gs.WriteVram(0x3Fu, 0u, 1u, 0u, 0u, 0x0005180Bu);
+            gs.writeVramPixel(0x3Fu, 0u, 1u, 0u, 0u, 0x0005180Bu);
             t.Equals(static_cast<uint32_t>(vram[0]), 0xA5u,
                      "reserved PSM writes should leave VRAM unchanged");
         });
@@ -2822,7 +3061,7 @@ void register_ps2_gs_tests()
             t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
 
             GS gs;
-            gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
+            mem.bindGS(gs);
 
             const uint64_t signalValue = (0xFFFFFFFFull << 32) | 0x11223344ull;
             gs.writeRegister(GS_REG_SIGNAL, signalValue);
@@ -3501,9 +3740,9 @@ void register_ps2_gs_tests()
             // temporary CLUT region selected by CSA. Sampling then applies
             // CSA to that temporary buffer; it must not offset the VRAM read.
             // CT32 masks CSA bit 4, so CSA=17 aliases CSA=1.
-            gs.WriteVram(GS_PSM_CT32, kClutCbp, 1u, 0u, 0u, kExpectedColor);
-            gs.WriteVram(GS_PSM_CT32, kClutCbp, 1u, 8u, 0u, kWrongLiveVramOffsetColor);
-            gs.WriteVram(GS_PSM_CT32, kClutCbp, 1u, 8u, 16u, kWrongBit4Color);
+            gs.writeVramPixel(GS_PSM_CT32, kClutCbp, 1u, 0u, 0u, kExpectedColor);
+            gs.writeVramPixel(GS_PSM_CT32, kClutCbp, 1u, 8u, 0u, kWrongLiveVramOffsetColor);
+            gs.writeVramPixel(GS_PSM_CT32, kClutCbp, 1u, 8u, 16u, kWrongBit4Color);
 
             gs.writeRegister(GS_REG_FRAME_1, kFrameReg);
             gs.writeRegister(GS_REG_ZBUF_1, kZbuf);
@@ -3570,9 +3809,9 @@ void register_ps2_gs_tests()
             // CSA selects the destination region in the temporary CLUT, not
             // an offset into palette VRAM. Load different snapshots from the
             // same CSM1 source entry into the lower and upper CT16 halves.
-            gs.WriteVram(GS_PSM_CT16, kClutCbp, 1u, 1u, 0u, kLowerGreen);
+            gs.writeVramPixel(GS_PSM_CT16, kClutCbp, 1u, 1u, 0u, kLowerGreen);
             gs.writeRegister(GS_REG_TEX0_1, tex0For(0u, 1u));
-            gs.WriteVram(GS_PSM_CT16, kClutCbp, 1u, 1u, 0u, kUpperRed);
+            gs.writeVramPixel(GS_PSM_CT16, kClutCbp, 1u, 1u, 0u, kUpperRed);
             gs.writeRegister(GS_REG_TEX0_1, tex0For(16u, 1u));
 
             gs.writeRegister(GS_REG_FRAME_1, kFrameReg);
@@ -3627,13 +3866,14 @@ void register_ps2_gs_tests()
             constexpr uint32_t kExpectedColor = 0xFF3366CCu;
             constexpr uint32_t kUnsaturatedColor = 0xFF00FF00u;
 
-            gs.WriteVram(GS_PSM_CT32, kTexTbp, 16u, 1u, 0u, kExpectedColor);
-            gs.WriteVram(GS_PSM_CT32, kTexTbp, 16u, 32u, 0u, kUnsaturatedColor);
+            gs.writeVramPixel(GS_PSM_CT32, kTexTbp, 16u, 1u, 0u, kExpectedColor);
+            gs.writeVramPixel(GS_PSM_CT32, kTexTbp, 16u, 32u, 0u, kUnsaturatedColor);
             gs.writeRegister(GS_REG_TEX0_1, kTex0);
             gs.writeRegister(GS_REG_PRIM, kPrim);
 
+            const GSPrimitiveSubmission submission = gs.capturePrimitiveSubmission();
             const uint32_t sampled =
-                rasterizer.sampleTexture(&gs, 1.0f / 1024.0f, 0.0f, 1.0f, 0u, 0u);
+                rasterizer.sampleTexture(&gs, submission, 1.0f / 1024.0f, 0.0f, 1.0f, 0u, 0u);
             t.Equals(sampled, kExpectedColor,
                      "TW/TH values above 10 should address a 1024-pixel texture instead of growing beyond GS limits");
         });
@@ -3856,7 +4096,7 @@ void register_ps2_gs_tests()
                 (1ull << 8);
 
             writePSMT8Texel(vram, kTexTbp, 1u, 0u, 0u, 0u);
-            gs.WriteVram(GS_PSM_CT32, kClutCbp, 1u, 0u, 0u, kInitialColor);
+            gs.writeVramPixel(GS_PSM_CT32, kClutCbp, 1u, 0u, 0u, kInitialColor);
 
             gs.writeRegister(GS_REG_FRAME_1,
                              (1ull << 16) |
@@ -3881,7 +4121,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_TEX0_1, kTex0Base | (1ull << 61));
             drawAt(0u);
 
-            gs.WriteVram(GS_PSM_CT32, kClutCbp, 1u, 0u, 0u, kUpdatedColor);
+            gs.writeVramPixel(GS_PSM_CT32, kClutCbp, 1u, 0u, 0u, kUpdatedColor);
             gs.writeRegister(GS_REG_TEX0_1, kTex0Base); // CLD=0: retain the existing CLUT snapshot.
             drawAt(1u);
 
@@ -3929,8 +4169,8 @@ void register_ps2_gs_tests()
             };
 
             writePSMT8Texel(vram, kTexTbp, 1u, 0u, 0u, 0u);
-            gs.WriteVram(GS_PSM_CT32, kClutCbpA, 1u, 0u, 0u, kColorA);
-            gs.WriteVram(GS_PSM_CT32, kClutCbpB, 1u, 0u, 0u, kColorB);
+            gs.writeVramPixel(GS_PSM_CT32, kClutCbpA, 1u, 0u, 0u, kColorA);
+            gs.writeVramPixel(GS_PSM_CT32, kClutCbpB, 1u, 0u, 0u, kColorB);
 
             gs.writeRegister(GS_REG_FRAME_1,
                              (1ull << 16) |
@@ -3955,7 +4195,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_TEX0_1, tex0For(kClutCbpA, 2u));
             drawAt(0u);
 
-            gs.WriteVram(GS_PSM_CT32, kClutCbpA, 1u, 0u, 0u, kOverwrittenA);
+            gs.writeVramPixel(GS_PSM_CT32, kClutCbpA, 1u, 0u, 0u, kOverwrittenA);
             gs.writeRegister(GS_REG_TEX0_1, tex0For(kClutCbpA, 4u));
             drawAt(1u);
 
@@ -5475,6 +5715,86 @@ void register_ps2_gs_tests()
             }
             t.IsTrue(pattern2Ok,
                      "second T4HL transfer to a different DBP should be byte-correct, proving the discarded excess bytes from the first transfer did not leak into subsequent transfer state");
+        });
+    });
+
+    MiniTest::Case("PS2GS VRAM tracking", [](TestCase &tc)
+    {
+        tc.Run("opt-in tracking reports swizzled byte ranges, packed RMW reads, and scoped versions", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            t.IsTrue(!gs.vramAccessTrackingEnabled(), "VRAM instrumentation is disabled by default");
+            t.IsTrue(!gs.captureVramRangeVersion(0u, 4u).valid,
+                     "a version snapshot requires tracking to be enabled");
+            gs.setVramAccessTrackingEnabled(true);
+
+            GSMem::PixelByteRange ct32{};
+            GSMem::PixelByteRange ct24{};
+            GSMem::PixelByteRange t8h{};
+            GSMem::PixelByteRange t4{};
+            t.IsTrue(GSMem::GetPixelByteRange(GS_PSM_CT32, 0u, 1u, 0u, 0u, ct32),
+                     "CT32 resolves to a physical byte range");
+            t.IsTrue(GSMem::GetPixelByteRange(GS_PSM_CT24, 0u, 1u, 0u, 0u, ct24),
+                     "CT24 resolves to its read-modify-write word");
+            t.IsTrue(GSMem::GetPixelByteRange(GS_PSM_T8H, 0u, 1u, 0u, 0u, t8h),
+                     "T8H resolves to its alpha-byte alias");
+            t.IsTrue(GSMem::GetPixelByteRange(GS_PSM_T4, 0u, 1u, 0u, 0u, t4),
+                     "T4 resolves to its packed byte");
+            t.Equals(ct24.offset, ct32.offset, "CT24 and CT32 alias the same physical word");
+            t.Equals(ct24.sizeBytes, 4u, "CT24 RMW covers the full preserved word");
+            t.IsTrue(ct24.readModifyWrite, "CT24 is reported as a read-modify-write access");
+            t.Equals(t8h.offset, ct32.offset + 3u, "T8H addresses the high byte of the CT32 word");
+            t.Equals(t4.sizeBytes, 1u, "T4 reports its actual packed byte footprint");
+            t.IsTrue(t4.readModifyWrite, "T4 nibble writes require a byte read-modify-write");
+
+            gs.writeVramPixel(GS_PSM_CT32, 0u, 1u, 0u, 0u, 0x11223344u);
+            const uint64_t firstWriteSequence = gs.operationSequence();
+            const auto firstAccesses = gs.vramOperationAccesses(firstWriteSequence);
+            t.Equals(firstAccesses.writeRanges.size(), 1u, "one contiguous tracked block is returned for a pixel write");
+            if (!firstAccesses.writeRanges.empty())
+            {
+                t.Equals(firstAccesses.writeRanges[0].offset, 0u, "swizzled CT32 origin maps to physical byte zero");
+                t.Equals(firstAccesses.writeRanges[0].sizeBytes, 64u,
+                         "operation ranges conservatively round to the 64-byte tracking granularity");
+            }
+            const auto version = gs.captureVramRangeVersion(ct32.offset, ct32.sizeBytes);
+            t.IsTrue(gs.isVramRangeVersionCurrent(version), "a freshly captured range version is current");
+
+            t.IsTrue(gs.fillVramBytes(256u, 0xA5u, 4u), "write to a separate physical block succeeds");
+            t.IsTrue(gs.isVramRangeVersionCurrent(version),
+                     "writes outside the captured 64-byte block do not invalidate its version");
+            gs.writeVramPixel(GS_PSM_CT24, 0u, 1u, 0u, 0u, 0x00556677u);
+            t.IsTrue(!gs.isVramRangeVersionCurrent(version),
+                     "an aliased CT24 write invalidates the overlapping CT32 range version");
+            const auto aliasAccesses = gs.vramOperationAccesses(gs.operationSequence());
+            t.IsTrue(!aliasAccesses.readRanges.empty(),
+                     "the CT24 preserve operation records its physical read-modify-write read");
+            t.IsTrue(!aliasAccesses.writeRanges.empty(), "the CT24 write records the same physical block");
+
+            gs.writeVramPixel(GS_PSM_T4, 0u, 1u, 0u, 0u, 0xBu);
+            const auto packedAccesses = gs.vramOperationAccesses(gs.operationSequence());
+            t.IsTrue(!packedAccesses.readRanges.empty(),
+                     "packed T4 nibble writes record the containing-byte read");
+            t.IsTrue(!packedAccesses.writeRanges.empty(),
+                     "packed T4 nibble writes record the containing-byte update");
+
+            gs.writeVramPixel(GS_PSM_T8H, 0u, 1u, 0u, 0u, 0xA5u);
+            const auto highByteAccesses = gs.vramOperationAccesses(gs.operationSequence());
+            t.IsTrue(!highByteAccesses.writeRanges.empty(),
+                     "T8H writes report the aliased high byte through its physical CT32 word");
+
+            const uint64_t copySequence = gs.operationSequence();
+            std::array<uint8_t, 4> copied{};
+            t.IsTrue(gs.copyVramBytes(0u, copied.data(), copied.size()), "range copy succeeds");
+            const auto readAccesses = gs.vramOperationAccesses(copySequence);
+            t.IsTrue(!readAccesses.readRanges.empty(), "raw VRAM copies are included in read access ranges");
+
+            std::vector<uint8_t> replacementVram(PS2_GS_VRAM_SIZE, 0u);
+            gs.init(replacementVram.data(), static_cast<uint32_t>(replacementVram.size()), nullptr);
+            t.IsTrue(!gs.isVramRangeVersionCurrent(version),
+                     "reinitializing the GS invalidates snapshots from the previous VRAM binding");
         });
     });
 }

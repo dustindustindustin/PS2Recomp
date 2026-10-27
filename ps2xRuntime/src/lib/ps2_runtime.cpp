@@ -5,6 +5,7 @@
 #include "game_overrides.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/ps2_gs_gpu.h"
+#include "runtime/ps2_frame_upload.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
@@ -585,6 +586,11 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     static bool s_hasUploadedFrame = false;
     static std::vector<uint8_t> s_scratch;
     static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
+    static std::vector<uint8_t> s_uploadedBuffer(DEFAULT_FB_SIZE, 0u);
+    static std::vector<uint8_t> s_rectUploadBuffer;
+    static std::vector<PS2FrameUpload::Rect> s_dirtyRects;
+    static bool s_hasTextureCache = false;
+    static unsigned int s_cachedTextureId = 0u;
 
     const uint64_t currentTick = ps2_syscalls::GetCurrentVSyncTick();
     const uint64_t publishedGeneration = rt->gs().hostPresentationGeneration();
@@ -685,17 +691,72 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         frameDumpPath != nullptr && *frameDumpPath != '\0' &&
         (currentTick % 60u) == 0u && width != 0u && height != 0u)
     {
-        std::ofstream dump(frameDumpPath, std::ios::binary | std::ios::trunc);
-        if (dump)
+        const bool contentBearingOnly =
+            std::getenv("PS2X_AUTOMATED_FRAME_DUMP_CONTENT_BEARING") != nullptr;
+        bool writeFrameDump = true;
+        if (contentBearingOnly)
         {
-            dump << "P6\n" << width << ' ' << height << "\n255\n";
-            for (uint32_t y = 0u; y < height; ++y)
+            uint64_t nonBlackPixels = 0u;
+            for (size_t offset = 0u; offset + 2u < s_scratch.size(); offset += 4u)
             {
-                const size_t rowOffset = static_cast<size_t>(y) * width * 4u;
-                for (uint32_t x = 0u; x < width; ++x)
+                nonBlackPixels += (s_scratch[offset] != 0u ||
+                                   s_scratch[offset + 1u] != 0u ||
+                                   s_scratch[offset + 2u] != 0u) ? 1u : 0u;
+            }
+            std::ifstream existing(frameDumpPath, std::ios::binary);
+            writeFrameDump = nonBlackPixels >= 100000u && !existing.good();
+        }
+        if (writeFrameDump)
+        {
+            std::ofstream dump(frameDumpPath, std::ios::binary | std::ios::trunc);
+            if (dump)
+            {
+                dump << "P6\n" << width << ' ' << height << "\n255\n";
+                for (uint32_t y = 0u; y < height; ++y)
                 {
-                    const size_t pixelOffset = rowOffset + static_cast<size_t>(x) * 4u;
-                    dump.write(reinterpret_cast<const char *>(s_scratch.data() + pixelOffset), 3u);
+                    const size_t rowOffset = static_cast<size_t>(y) * width * 4u;
+                    for (uint32_t x = 0u; x < width; ++x)
+                    {
+                        const size_t pixelOffset = rowOffset + static_cast<size_t>(x) * 4u;
+                        dump.write(reinterpret_cast<const char *>(s_scratch.data() + pixelOffset), 3u);
+                    }
+                }
+            }
+        }
+    }
+
+    if (const char *historyPath = std::getenv("PS2X_AUTOMATED_FRAME_HISTORY");
+        historyPath != nullptr && *historyPath != '\0' &&
+        width != 0u && height != 0u)
+    {
+        static uint64_t s_historyFrame = 0u;
+        static auto s_lastHistoryDump = std::chrono::steady_clock::time_point{};
+        const auto historyNow = std::chrono::steady_clock::now();
+        if (historyNow - s_lastHistoryDump >= std::chrono::seconds(5))
+        {
+            s_lastHistoryDump = historyNow;
+            std::error_code ec;
+            const std::filesystem::path directory(historyPath);
+            std::filesystem::create_directories(directory, ec);
+            if (!ec)
+            {
+                char filename[64]{};
+                std::snprintf(filename, sizeof(filename), "frame-%06llu-tick-%llu.ppm",
+                              static_cast<unsigned long long>(++s_historyFrame),
+                              static_cast<unsigned long long>(currentTick));
+                std::ofstream dump(directory / filename, std::ios::binary | std::ios::trunc);
+                if (dump)
+                {
+                    dump << "P6\n" << width << ' ' << height << "\n255\n";
+                    for (uint32_t y = 0u; y < height; ++y)
+                    {
+                        const size_t rowOffset = static_cast<size_t>(y) * width * 4u;
+                        for (uint32_t x = 0u; x < width; ++x)
+                        {
+                            const size_t pixelOffset = rowOffset + static_cast<size_t>(x) * 4u;
+                            dump.write(reinterpret_cast<const char *>(s_scratch.data() + pixelOffset), 3u);
+                        }
+                    }
                 }
             }
         }
@@ -752,6 +813,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                          "\tnonblack\tmax_rgb\tdraw_count\tgif_packets"
                          "\talpha_min\talpha_max\tnonopaque\n";
             }
+            (void)rt->gs();
             const GSRegisters &priv = rt->memory().gs();
             const uint64_t divisor = std::max<uint64_t>(pixelCount, 1u);
             trace << currentTick
@@ -782,6 +844,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         (currentTick % 60u) == 0u)
     {
         const GSDebugSnapshot gs = rt->gs().getDebugSnapshot();
+        (void)rt->gs();
         const GSRegisters &priv = rt->memory().gs();
         std::ofstream dump(stateDumpPath, std::ios::trunc);
         if (dump)
@@ -913,7 +976,104 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         }
     }
 
-    UpdateTexture(tex, s_uploadBuffer.data());
+    const bool collectUploadStats = std::getenv("PS2X_FRAME_UPLOAD_STATS") != nullptr;
+    const char *uploadModeValue = std::getenv("PS2X_FRAME_UPLOAD_MODE");
+    const bool forceFullUpload = uploadModeValue != nullptr &&
+                                 std::strcmp(uploadModeValue, "full") == 0;
+    const auto uploadStart = collectUploadStats ? std::chrono::steady_clock::now()
+                                                : std::chrono::steady_clock::time_point{};
+    uint64_t uploadedBytes = 0u;
+    uint64_t uploadCalls = 0u;
+    bool usedFullUpload = false;
+    if (!s_hasTextureCache || s_cachedTextureId != tex.id)
+    {
+        UpdateTexture(tex, s_uploadBuffer.data());
+        s_hasTextureCache = true;
+        s_cachedTextureId = tex.id;
+        uploadedBytes = s_uploadBuffer.size();
+        uploadCalls = 1u;
+        usedFullUpload = true;
+    }
+    else
+    {
+        const bool useFullUpload = forceFullUpload || PS2FrameUpload::BuildDirtyTileRects(
+            s_uploadBuffer.data(), s_uploadedBuffer.data(), FB_WIDTH, FB_HEIGHT, 32u, 64u, s_dirtyRects);
+        if (useFullUpload)
+        {
+            UpdateTexture(tex, s_uploadBuffer.data());
+            uploadedBytes = s_uploadBuffer.size();
+            uploadCalls = 1u;
+            usedFullUpload = true;
+        }
+        else
+        {
+            for (const PS2FrameUpload::Rect &rect : s_dirtyRects)
+            {
+                if (!PS2FrameUpload::PackRectRgba(s_uploadBuffer.data(), FB_WIDTH, FB_HEIGHT,
+                                                  rect, s_rectUploadBuffer))
+                {
+                    // Planner output should always be valid. A conservative full
+                    // upload keeps presentation correct if that contract breaks.
+                    UpdateTexture(tex, s_uploadBuffer.data());
+                    uploadedBytes = s_uploadBuffer.size();
+                    ++uploadCalls;
+                    usedFullUpload = true;
+                    break;
+                }
+                UpdateTextureRec(tex,
+                                 Rectangle{static_cast<float>(rect.x), static_cast<float>(rect.y),
+                                           static_cast<float>(rect.width), static_cast<float>(rect.height)},
+                                 s_rectUploadBuffer.data());
+                uploadedBytes += s_rectUploadBuffer.size();
+                ++uploadCalls;
+            }
+        }
+    }
+    // Both vectors are the same fixed-size staging allocation. Swap roles to
+    // preserve the just-uploaded frame without copying the full 1.25 MiB.
+    s_uploadedBuffer.swap(s_uploadBuffer);
+    const uint64_t uploadElapsedNanoseconds = collectUploadStats
+        ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - uploadStart).count())
+        : 0u;
+
+    if (collectUploadStats)
+    {
+        static uint64_t s_statsFrames = 0u;
+        static uint64_t s_statsBytes = 0u;
+        static uint64_t s_statsCalls = 0u;
+        static uint64_t s_statsFullUploads = 0u;
+        static uint64_t s_statsCpuNanoseconds = 0u;
+        static uint64_t s_statsMaxCpuNanoseconds = 0u;
+        s_statsBytes += uploadedBytes;
+        s_statsCalls += uploadCalls;
+        s_statsFullUploads += usedFullUpload ? 1u : 0u;
+        s_statsCpuNanoseconds += uploadElapsedNanoseconds;
+        s_statsMaxCpuNanoseconds = std::max(s_statsMaxCpuNanoseconds, uploadElapsedNanoseconds);
+        if (++s_statsFrames >= 60u)
+        {
+            const char *mode = forceFullUpload ? "full" : "adaptive";
+            const int64_t utcEpochMilliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            std::cout << "[frame:upload-stats] utcEpochMs=" << utcEpochMilliseconds
+                      << " frames=" << s_statsFrames
+                      << " mode=" << mode
+                      << " bytes=" << s_statsBytes
+                      << " avgBytes=" << (s_statsBytes / s_statsFrames)
+                      << " calls=" << s_statsCalls
+                      << " full=" << s_statsFullUploads
+                      << " avgCpuUs=" << (static_cast<double>(s_statsCpuNanoseconds) /
+                                             static_cast<double>(s_statsFrames) / 1000.0)
+                      << " maxCpuUs=" << (static_cast<double>(s_statsMaxCpuNanoseconds) / 1000.0)
+                      << '\n' << std::flush;
+            s_statsFrames = 0u;
+            s_statsBytes = 0u;
+            s_statsCalls = 0u;
+            s_statsFullUploads = 0u;
+            s_statsCpuNanoseconds = 0u;
+            s_statsMaxCpuNanoseconds = 0u;
+        }
+    }
     outWidth = width;
     outHeight = height;
     s_hasUploadedFrame = true;
@@ -998,6 +1158,11 @@ PS2Runtime::~PS2Runtime()
     {
         requestStop();
         ps2_syscalls::detachAllGuestHostThreads();
+        m_gifArbiter.setAsyncEnabled(false);
+        m_gsGpuPointQueue.close();
+        m_gs.setGpuPointExecutor({});
+        m_gs.setOwnerPumpQueue(nullptr, false);
+        m_gsRenderQueue.close();
         m_iopSubsystem.reset();
         m_iopHost.reset();
 #if defined(PLATFORM_VITA)
@@ -1006,8 +1171,8 @@ PS2Runtime::~PS2Runtime()
 #else
         if (IsAudioDeviceReady())
         {
-            CloseAudioDevice();
             m_audioBackend.setAudioReady(false);
+            CloseAudioDevice();
         }
 #endif
         if (m_debugUiInitialized && m_debugUiShutdownCallback)
@@ -1074,20 +1239,27 @@ ps2x::iop::DebugSnapshot PS2Runtime::iopDebugSnapshot() const
 bool PS2Runtime::syncCoreSubsystems()
 {
     uint8_t *const rdram = m_memory.getRDRAM();
-    uint8_t *const gsVram = m_memory.getGSVRAM();
-    if (!rdram || !gsVram)
+    const uint64_t gsVramGeneration = m_memory.gsVramGeneration();
+    if (!rdram || gsVramGeneration == 0u)
     {
         return false;
     }
 
-    if (m_boundRdram == rdram && m_boundGSVram == gsVram)
+    if (m_boundRdram == rdram && m_boundGSVramGeneration == gsVramGeneration)
     {
         return true;
     }
 
-    m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
+    if (!m_memory.bindGS(m_gs))
+        return false;
+    const char *gsOwnerPumpEnvironment = std::getenv("PS2X_GS_OWNER_PUMP");
+    m_gs.setOwnerPumpQueue(&m_gsRenderQueue,
+                           gsOwnerPumpEnvironment && std::strcmp(gsOwnerPumpEnvironment, "1") == 0);
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                     { m_gs.processGIFPacket(data, size); });
+    const char *asyncGifEnvironment = std::getenv("PS2X_ASYNC_GIF");
+    m_gifArbiter.setAsyncEnabled(asyncGifEnvironment &&
+                                 std::strcmp(asyncGifEnvironment, "1") == 0);
     m_memory.setGifArbiter(&m_gifArbiter);
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
@@ -1120,7 +1292,7 @@ bool PS2Runtime::syncCoreSubsystems()
     m_vu1.reset();
 
     m_boundRdram = rdram;
-    m_boundGSVram = gsVram;
+    m_boundGSVramGeneration = gsVramGeneration;
     return true;
 }
 
@@ -1482,6 +1654,10 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
         paths.hostRoot = paths.elfDirectory;
         paths.cdRoot = paths.elfDirectory;
         paths.mcRoot = paths.elfDirectory / "mc0";
+    }
+    if (const char *mcRoot = std::getenv("PS2X_MC_ROOT"); mcRoot != nullptr && *mcRoot != '\0')
+    {
+        paths.mcRoot = std::filesystem::path(mcRoot);
     }
 
     setIoPaths(paths);
@@ -2543,6 +2719,10 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
         {
             GuestExecutionScope guestExecution(this);
             fn(rdram, ctx, this);
+            if (m_performanceMetricsEnabled)
+            {
+                m_performanceGuestDispatches.fetch_add(1u, std::memory_order_relaxed);
+            }
             handoffBaseline = guestExecutionHandoffEpochSnapshot();
         }
 
@@ -2677,6 +2857,21 @@ void PS2Runtime::observeGuestLoopWatch(uint8_t *rdram, const R5900Context *ctx, 
     }
 }
 
+void PS2Runtime::acquireGuestExecutionLock()
+{
+    if (!m_performanceLockTimingEnabled)
+    {
+        m_guestExecutionMutex.lock();
+        return;
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    m_guestExecutionMutex.lock();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - begin).count();
+    m_performanceLockWaitNanoseconds.fetch_add(static_cast<uint64_t>(elapsed), std::memory_order_relaxed);
+    m_performanceLockSamples.fetch_add(1u, std::memory_order_relaxed);
+}
+
 void PS2Runtime::enterGuestExecution()
 {
     uint32_t &depth = g_guestExecutionDepths[this];
@@ -2689,7 +2884,7 @@ void PS2Runtime::enterGuestExecution()
     }
 
     m_guestExecutionWaiters.fetch_add(1u, std::memory_order_acq_rel);
-    m_guestExecutionMutex.lock();
+    acquireGuestExecutionLock();
     m_guestExecutionWaiters.fetch_sub(1u, std::memory_order_acq_rel);
     depth = 1u;
     markGuestExecutionAcquired();
@@ -2741,7 +2936,7 @@ void PS2Runtime::reacquireGuestExecution(uint32_t depth)
     if (heldDepth == 0u)
     {
         m_guestExecutionWaiters.fetch_add(1u, std::memory_order_acq_rel);
-        m_guestExecutionMutex.lock();
+        acquireGuestExecutionLock();
         m_guestExecutionWaiters.fetch_sub(1u, std::memory_order_acq_rel);
         heldDepth = 1u;
         markGuestExecutionAcquired();
@@ -3121,6 +3316,72 @@ void PS2Runtime::run()
     Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
     Texture2D frameTex = LoadTextureFromImage(blank);
     UnloadImage(blank);
+    RenderTexture2D gpuPointTarget{};
+    bool gpuPointReady = false;
+    std::atomic<uint64_t> gpuPointRequests{0u};
+    std::atomic<uint64_t> gpuPointReadbacks{0u};
+    std::atomic<uint64_t> gpuPointCommits{0u};
+    const auto renderOpaqueGpuPoint = [&gpuPointTarget](uint32_t rgba32,
+                                                       uint32_t &outResult) -> bool
+    {
+        BeginTextureMode(gpuPointTarget);
+        ClearBackground(BLANK);
+        DrawPixel(0, 0, Color{
+            static_cast<unsigned char>(rgba32),
+            static_cast<unsigned char>(rgba32 >> 8u),
+            static_cast<unsigned char>(rgba32 >> 16u),
+            static_cast<unsigned char>(rgba32 >> 24u)});
+        EndTextureMode();
+        Image readback = LoadImageFromTexture(gpuPointTarget.texture);
+        if (!IsImageValid(readback))
+            return false;
+        const Color pixel = GetImageColor(readback, 0, 0);
+        outResult = static_cast<uint32_t>(pixel.r) |
+            (static_cast<uint32_t>(pixel.g) << 8u) |
+            (static_cast<uint32_t>(pixel.b) << 16u) |
+            (static_cast<uint32_t>(pixel.a) << 24u);
+        UnloadImage(readback);
+        return true;
+    };
+#if !defined(PLATFORM_VITA)
+    const char *gpuPointSetting = std::getenv("PS2X_GS_GPU_CT32_POINT");
+    if (gpuPointSetting && std::strcmp(gpuPointSetting, "1") == 0)
+    {
+        gpuPointTarget = LoadRenderTexture(1, 1);
+        gpuPointReady = IsRenderTextureValid(gpuPointTarget);
+        if (gpuPointReady)
+        {
+            constexpr std::array<uint32_t, 3> kProbeColors{
+                0xFF123456u, 0xFF00FF00u, 0xFFDE80A5u};
+            for (const uint32_t color : kProbeColors)
+            {
+                uint32_t output = 0u;
+                if (!renderOpaqueGpuPoint(color, output) || output != color)
+                {
+                    gpuPointReady = false;
+                    break;
+                }
+            }
+            if (!gpuPointReady)
+                UnloadRenderTexture(gpuPointTarget);
+        }
+        if (gpuPointReady)
+        {
+            m_gs.setGpuPointExecutor([this, &gpuPointRequests, &gpuPointCommits]
+                                     (uint32_t rgba32, uint32_t &outResult)
+            {
+                gpuPointRequests.fetch_add(1u, std::memory_order_relaxed);
+                const bool succeeded = m_gsGpuPointQueue.submitAndWait(
+                    rgba32, outResult, std::chrono::milliseconds(50)) && outResult == rgba32;
+                if (succeeded)
+                    gpuPointCommits.fetch_add(1u, std::memory_order_relaxed);
+                return succeeded;
+            });
+        }
+        std::cout << "[gs-gpu-point] " << (gpuPointReady ? "enabled" : "unavailable; software fallback")
+                  << std::endl;
+    }
+#endif
 #if PS2X_HAS_FFMPEG && !defined(PLATFORM_VITA)
     HostStartupVideo startupVideo;
     if (const char *startupPath = std::getenv("PS2X_STARTUP_VIDEO");
@@ -3128,6 +3389,7 @@ void PS2Runtime::run()
     {
         std::cerr << "[startup-video] could not open " << startupPath << '\n';
     }
+    padBackend().setStartupInputCapture(startupVideo.active());
 #endif
 #if !defined(PLATFORM_VITA)
     // The PS2 output is usually enlarged by a non-integer amount on modern
@@ -3148,6 +3410,30 @@ void PS2Runtime::run()
 
     g_activeThreads.store(1, std::memory_order_relaxed);
     std::atomic<bool> gameThreadFinished{false};
+    const char *fastFstSetting = std::getenv("PS2X_GS_FAST_FST_POINT");
+    m_gs.setFastFstPointSamplingEnabled(!fastFstSetting ||
+        std::strcmp(fastFstSetting, "0") != 0);
+    const char *samplerStatsSetting = std::getenv("PS2X_GS_SAMPLER_STATS");
+    const bool samplerStatsEnabled = samplerStatsSetting &&
+        std::strcmp(samplerStatsSetting, "1") == 0;
+    m_gs.setSamplerStatsEnabled(samplerStatsEnabled);
+    const char *pixelStateStatsSetting = std::getenv("PS2X_GS_PIXEL_STATE_STATS");
+    const bool pixelStateStatsEnabled = pixelStateStatsSetting &&
+        std::strcmp(pixelStateStatsSetting, "1") == 0;
+    m_gs.setPixelStateStatsEnabled(pixelStateStatsEnabled);
+    const char *performanceMetricsPath = std::getenv("PS2X_PERF_METRICS_PATH");
+    m_performanceMetricsEnabled =
+        performanceMetricsPath != nullptr && *performanceMetricsPath != '\0';
+    const char *frameIntervalTelemetry = std::getenv("PS2X_PERF_FRAME_INTERVALS");
+    const bool performanceFrameIntervalsEnabled = m_performanceMetricsEnabled &&
+        frameIntervalTelemetry != nullptr && std::strcmp(frameIntervalTelemetry, "1") == 0;
+    m_gs.setFrameIntervalTelemetryEnabled(performanceFrameIntervalsEnabled);
+    m_performanceGuestDispatches.store(0u, std::memory_order_relaxed);
+    const char *lockTiming = std::getenv("PS2X_PERF_LOCK_TIMING");
+    m_performanceLockTimingEnabled = m_performanceMetricsEnabled &&
+                                    lockTiming != nullptr && std::strcmp(lockTiming, "1") == 0;
+    m_performanceLockWaitNanoseconds.store(0u, std::memory_order_relaxed);
+    m_performanceLockSamples.store(0u, std::memory_order_relaxed);
 
     std::thread gameThread([&]()
                            {
@@ -3174,11 +3460,37 @@ void PS2Runtime::run()
 
     uint64_t tick = 0;
     uint64_t hostFrame = 0;
+    const auto performanceStart = std::chrono::steady_clock::now();
+    auto nextPerformanceSample = performanceStart + std::chrono::seconds(1);
+    std::ofstream performanceMetrics;
+    if (m_performanceMetricsEnabled)
+    {
+        performanceMetrics.open(performanceMetricsPath, std::ios::out | std::ios::trunc);
+        if (performanceMetrics)
+        {
+            performanceMetrics << "elapsed_seconds\tutc_epoch_ms\thost_frames\tpresented_frames"
+                                  "\tguest_dispatches\tgs_draws\tgs_transfers"
+                                  "\tvu0_runs\tvu0_pairs\tvu1_runs\tvu1_pairs"
+                                  "\tguest_pc\tguest_ra\tguest_sp\tguest_gp"
+                                  "\tguest_lock_acquisitions\tguest_handoff_timeouts"
+                                  "\tguest_lock_timing_enabled\tguest_lock_wait_ns\tguest_lock_samples"
+                                  "\tframe_interval_samples\tframe_interval_dropped\tframe_intervals_us\n";
+        }
+    }
     const bool automatedStart = std::getenv("PS2X_AUTOMATED_PAD_START") != nullptr;
     const bool automatedNewGame = std::getenv("PS2X_AUTOMATED_NEW_GAME") != nullptr;
     const bool automatedContinue = std::getenv("PS2X_AUTOMATED_CONTINUE") != nullptr;
     const bool automatedLevelSelect =
         std::getenv("PS2X_AUTOMATED_LEVEL_SELECT") != nullptr;
+    const bool automatedDuelPresentedClock = [] {
+        const char *clock = std::getenv("PS2X_AUTOMATED_DUEL_INPUT_CLOCK");
+        return clock != nullptr && std::strcmp(clock, "presented") == 0;
+    }();
+    const bool automatedDuelVisualStart =
+        automatedLevelSelect && automatedDuelPresentedClock &&
+        std::getenv("PS2X_AUTOMATED_DUEL_VISUAL_START") != nullptr;
+    const bool automatedDuelVisualRoute = automatedDuelVisualStart &&
+        automatedContinue && std::getenv("PS2X_AUTOMATED_DUEL_VISUAL_ROUTE") != nullptr;
     uint64_t automatedNewGameFrame = 3600u;
     if (const char *configuredFrame = std::getenv("PS2X_AUTOMATED_NEW_GAME_FRAME");
         configuredFrame != nullptr && *configuredFrame != '\0')
@@ -3188,7 +3500,7 @@ void PS2Runtime::run()
         if (end != configuredFrame && *end == '\0' && parsed >= 120u)
             automatedNewGameFrame = static_cast<uint64_t>(parsed);
     }
-    uint64_t automatedContinueFrame = 3600u;
+    uint64_t automatedContinueFrame = 1800u;
     if (const char *configuredFrame = std::getenv("PS2X_AUTOMATED_CONTINUE_FRAME");
         configuredFrame != nullptr && *configuredFrame != '\0')
     {
@@ -3206,57 +3518,385 @@ void PS2Runtime::run()
         if (end != configuredFrame && *end == '\0' && parsed >= 120u)
             automatedLevelSelectFrame = static_cast<uint64_t>(parsed);
     }
+    uint64_t automatedLevelConfirmFrame = automatedLevelSelectFrame + 300u;
+    if (const char *configuredFrame = std::getenv("PS2X_AUTOMATED_LEVEL_CONFIRM_FRAME");
+        configuredFrame != nullptr && *configuredFrame != '\0')
+    {
+        char *end = nullptr;
+        const unsigned long long parsed = std::strtoull(configuredFrame, &end, 0);
+        if (end != configuredFrame && *end == '\0' && parsed >= 120u)
+            automatedLevelConfirmFrame = static_cast<uint64_t>(parsed);
+    }
+    uint64_t automatedDuelStartFrame = automatedLevelConfirmFrame + 300u;
+    if (const char *configuredFrame = std::getenv("PS2X_AUTOMATED_DUEL_START_FRAME");
+        configuredFrame != nullptr && *configuredFrame != '\0')
+    {
+        char *end = nullptr;
+        const unsigned long long parsed = std::strtoull(configuredFrame, &end, 0);
+        if (end != configuredFrame && *end == '\0' && parsed >= 120u)
+            automatedDuelStartFrame = static_cast<uint64_t>(parsed);
+    }
+    // A six-refresh pulse can fall entirely between guest pad polls when the
+    // software GS is presenting only a few new game frames per second.
+    uint64_t automatedDuelPressFrames = 30u;
+    if (const char *configuredFrames = std::getenv("PS2X_AUTOMATED_DUEL_PRESS_FRAMES");
+        configuredFrames != nullptr && *configuredFrames != '\0')
+    {
+        char *end = nullptr;
+        const unsigned long long parsed = std::strtoull(configuredFrames, &end, 0);
+        if (end != configuredFrames && *end == '\0' && parsed >= 1u && parsed <= 120u)
+            automatedDuelPressFrames = static_cast<uint64_t>(parsed);
+    }
+    uint64_t automatedDuelPressTicks = 6u;
+    if (const char *configuredTicks = std::getenv("PS2X_AUTOMATED_DUEL_PRESS_TICKS");
+        configuredTicks != nullptr && *configuredTicks != '\0')
+    {
+        char *end = nullptr;
+        const unsigned long long parsed = std::strtoull(configuredTicks, &end, 0);
+        if (end != configuredTicks && *end == '\0' && parsed >= 1u && parsed <= 120u)
+            automatedDuelPressTicks = static_cast<uint64_t>(parsed);
+    }
     bool reportedAutomatedStart = false;
     bool reportedAutomatedCross = false;
     bool reportedAutomatedDown = false;
     bool reportedAutomatedLevelSelect = false;
+    bool reportedAutomatedLevelConfirm = false;
+    bool reportedAutomatedDuelStart = false;
+    bool reportedAutomatedVisualTimeout = false;
+    uint64_t lastInspectedDuelGeneration = 0u;
+    uint64_t automatedDuelVisualTriggerFrame = 0u;
+    uint32_t lastDuelTopBlue = 0u;
+    uint32_t lastDuelBottomDark = 0u;
+    std::vector<uint8_t> duelVisualPixels;
+    uint32_t duelRouteStage = 0u;
+    uint64_t duelRouteStageEnteredFrame = 0u;
+    uint64_t duelRouteDownFrame = 0u;
+    uint64_t duelRouteContinueFrame = 0u;
+    uint64_t duelRouteDismissFrame = 0u;
+    uint64_t duelRouteSelectFrame = 0u;
+    uint64_t duelRouteConfirmFrame = 0u;
+    uint64_t duelRouteMapVisibleSince = 0u;
+    bool duelRouteTimedOut = false;
+    bool duelRouteMenuNewVisible = false;
+    bool duelRouteContinueVisible = false;
+    bool duelRoutePopupVisible = false;
+    uint64_t duelRouteLastRetryLogFrame = 0u;
     while (!isStopRequested() && g_activeThreads.load(std::memory_order_relaxed) > 0)
     {
         ++hostFrame;
+        const uint64_t presentedFrame = m_gs.hostPresentationGeneration();
 #if PS2X_HAS_FFMPEG && !defined(PLATFORM_VITA)
         const bool startupWasActive = startupVideo.active();
+        // The pad queue retains a complete press/release within one host poll.
+        // Consume its captured Start so the hidden guest menu never sees it.
         if (startupWasActive &&
-            (IsKeyPressed(KEY_ENTER) ||
-             (IsGamepadAvailable(0) && IsGamepadButtonPressed(0, GAMEPAD_BUTTON_MIDDLE_RIGHT)) ||
+            (padBackend().consumeStartupStartPress() ||
              ((automatedStart || automatedNewGame || automatedContinue ||
                automatedLevelSelect) &&
               hostFrame >= 120u)))
             startupVideo.skip();
         startupVideo.update();
+        if (startupWasActive && !startupVideo.active())
+            padBackend().setStartupInputCapture(false);
 #endif
         if (automatedStart || automatedNewGame || automatedContinue ||
             automatedLevelSelect)
         {
-            const bool pressLevelSelect =
-                automatedLevelSelect && hostFrame >= automatedLevelSelectFrame &&
-                hostFrame < automatedLevelSelectFrame + 6u;
+            const uint64_t duelInputFrame =
+                automatedDuelPresentedClock ? presentedFrame : hostFrame;
+            const uint64_t duelPressDuration = automatedDuelPresentedClock
+                ? automatedDuelPressTicks : automatedDuelPressFrames;
+            if (automatedDuelVisualRoute && duelRouteStage < 6u && !duelRouteTimedOut &&
+                presentedFrame > lastInspectedDuelGeneration)
+            {
+                uint32_t width = 0u;
+                uint32_t height = 0u;
+                uint64_t copiedGeneration = 0u;
+                if (m_gs.copyLatchedHostPresentationFrame(
+                        duelVisualPixels, width, height, nullptr, nullptr,
+                        nullptr, &copiedGeneration) &&
+                    copiedGeneration > lastInspectedDuelGeneration &&
+                    width > 499u && height > 434u &&
+                    duelVisualPixels.size() >= static_cast<size_t>(width) * height * 4u)
+                {
+                    lastInspectedDuelGeneration = copiedGeneration;
+                    const auto pixel = [&](uint32_t x, uint32_t y) {
+                        return &duelVisualPixels[(static_cast<size_t>(y) * width + x) * 4u];
+                    };
+                    uint32_t menuTopGold = 0u;
+                    uint32_t menuContinueGold = 0u;
+                    uint32_t menuPopupBlack = 0u;
+                    uint32_t mapYellow = 0u;
+                    lastDuelTopBlue = 0u;
+                    lastDuelBottomDark = 0u;
+                    for (uint32_t x = 150u; x < 480u; x += 4u)
+                    {
+                        for (uint32_t y = 35u; y < 105u; y += 4u)
+                        {
+                            const auto *p = pixel(x, y);
+                            menuTopGold += p[0] > 90u && p[1] > 70u &&
+                                           static_cast<uint32_t>(p[0]) * 10u >
+                                               static_cast<uint32_t>(p[2]) * 13u;
+                        }
+                        for (uint32_t y = 120u; y < 190u; y += 4u)
+                        {
+                            const auto *p = pixel(x, y);
+                            menuContinueGold += p[0] > 90u && p[1] > 70u &&
+                                                static_cast<uint32_t>(p[0]) * 10u >
+                                                    static_cast<uint32_t>(p[2]) * 13u;
+                        }
+                    }
+                    for (uint32_t y = 200u; y < 240u; y += 4u)
+                        for (uint32_t x = 220u; x < 420u; x += 4u)
+                        {
+                            const auto *p = pixel(x, y);
+                            menuPopupBlack += p[0] < 20u && p[1] < 20u && p[2] < 20u;
+                        }
+                    for (uint32_t y = 200u; y < 350u; y += 4u)
+                        for (uint32_t x = 300u; x < 500u; x += 4u)
+                        {
+                            const auto *p = pixel(x, y);
+                            mapYellow += p[0] > 100u && p[1] > 80u && p[2] < 110u;
+                        }
+                    for (uint32_t y = 20u; y <= 47u; y += 4u)
+                        for (uint32_t x = 50u; x <= 359u; x += 4u)
+                        {
+                            const auto *p = pixel(x, y);
+                            lastDuelTopBlue += p[2] > static_cast<uint32_t>(p[0]) + 10u;
+                        }
+                    for (uint32_t y = 390u; y <= 434u; y += 4u)
+                        for (uint32_t x = 50u; x <= 359u; x += 4u)
+                        {
+                            const auto *p = pixel(x, y);
+                            lastDuelBottomDark +=
+                                p[0] < 110u && p[1] < 120u && p[2] < 140u;
+                        }
+                    const bool menuNew = menuTopGold >= 120u && menuContinueGold < 150u;
+                    const bool menuContinue = menuContinueGold >= 250u;
+                    const bool menuPopup = menuPopupBlack >= 400u;
+                    duelRouteMenuNewVisible = menuNew;
+                    duelRouteContinueVisible = menuContinue;
+                    duelRoutePopupVisible = menuPopup;
+                    const bool rexMap = mapYellow >= 400u && lastDuelTopBlue < 100u;
+                    const bool rexPanel = lastDuelTopBlue >= 100u &&
+                                          lastDuelBottomDark >= 500u;
+                    const auto advance = [&](uint32_t nextStage, const char *name) {
+                        duelRouteStage = nextStage;
+                        duelRouteStageEnteredFrame = copiedGeneration;
+                        std::cout << "[automated-input] Duel route cue " << name
+                                  << " at host frame " << hostFrame
+                                  << " presented frame " << copiedGeneration
+                                  << " menu_top=" << menuTopGold
+                                  << " menu_continue=" << menuContinueGold
+                                  << " popup_black=" << menuPopupBlack
+                                  << " map_yellow=" << mapYellow
+                                  << " top_blue=" << lastDuelTopBlue
+                                  << " bottom_dark=" << lastDuelBottomDark << std::endl;
+                    };
+                    if (duelRouteStage == 0u && menuNew)
+                    {
+                        duelRouteDownFrame = copiedGeneration;
+                        advance(1u, "menu-new");
+                    }
+                    else if (duelRouteStage == 1u && menuContinue && !menuPopup &&
+                             copiedGeneration >= duelRouteDownFrame + duelPressDuration + 12u)
+                    {
+                        duelRouteContinueFrame = copiedGeneration;
+                        advance(2u, "menu-continue");
+                    }
+                    else if (duelRouteStage == 2u && menuContinue && menuPopup &&
+                             copiedGeneration >= duelRouteContinueFrame + duelPressDuration + 12u)
+                    {
+                        duelRouteDismissFrame = copiedGeneration;
+                        advance(3u, "continue-loaded");
+                    }
+                    else if (duelRouteStage == 3u &&
+                             copiedGeneration >= duelRouteDismissFrame + duelPressDuration && rexMap)
+                    {
+                        if (duelRouteMapVisibleSince == 0u)
+                            duelRouteMapVisibleSince = copiedGeneration;
+                        if (copiedGeneration >= duelRouteMapVisibleSince + 80u)
+                        {
+                            duelRouteSelectFrame = copiedGeneration;
+                            advance(4u, "rex-map-ready");
+                        }
+                    }
+                    else if (duelRouteStage == 4u &&
+                             copiedGeneration >= duelRouteSelectFrame + 38u && rexMap)
+                    {
+                        duelRouteConfirmFrame = copiedGeneration;
+                        advance(5u, "rex-map-confirm");
+                    }
+                    else if (duelRouteStage == 5u &&
+                             copiedGeneration >= duelRouteConfirmFrame + duelPressDuration && rexPanel)
+                    {
+                        automatedDuelVisualTriggerFrame = copiedGeneration;
+                        advance(6u, "rex-panel-ready");
+                        std::cout << "[automated-input] Duel start visual cue at host frame "
+                                  << hostFrame << " presented frame " << copiedGeneration
+                                  << " top_blue=" << lastDuelTopBlue
+                                  << " bottom_dark=" << lastDuelBottomDark << std::endl;
+                    }
+                }
+                const uint64_t stageTimeout =
+                    (duelRouteStage == 0u || duelRouteStage == 3u) ? 1400u : 700u;
+                if (duelRouteStage < 6u &&
+                    presentedFrame >= duelRouteStageEnteredFrame + stageTimeout)
+                {
+                    duelRouteTimedOut = true;
+                    std::cout << "[automated-input] Duel route timed out at stage "
+                              << duelRouteStage << " host frame " << hostFrame
+                              << " presented frame " << presentedFrame << std::endl;
+                }
+            }
+            if (automatedDuelVisualStart && !automatedDuelVisualRoute &&
+                reportedAutomatedLevelConfirm &&
+                automatedDuelVisualTriggerFrame == 0u && !reportedAutomatedVisualTimeout &&
+                duelInputFrame >= automatedDuelStartFrame)
+            {
+                // The opponent panel appears at different presentation generations
+                // on different runs. Inspect each new latched image only once.
+                if (presentedFrame > lastInspectedDuelGeneration)
+                {
+                    uint32_t width = 0u;
+                    uint32_t height = 0u;
+                    uint64_t copiedGeneration = 0u;
+                    if (m_gs.copyLatchedHostPresentationFrame(
+                            duelVisualPixels, width, height, nullptr, nullptr,
+                            nullptr, &copiedGeneration) &&
+                        copiedGeneration > lastInspectedDuelGeneration)
+                    {
+                        lastInspectedDuelGeneration = copiedGeneration;
+                        lastDuelTopBlue = 0u;
+                        lastDuelBottomDark = 0u;
+                        if (width > 359u && height > 434u &&
+                            duelVisualPixels.size() >= static_cast<size_t>(width) * height * 4u)
+                        {
+                            for (uint32_t y = 20u; y <= 47u; y += 4u)
+                            {
+                                for (uint32_t x = 50u; x <= 359u; x += 4u)
+                                {
+                                    const size_t offset = (static_cast<size_t>(y) * width + x) * 4u;
+                                    lastDuelTopBlue += duelVisualPixels[offset + 2u] >
+                                        static_cast<uint32_t>(duelVisualPixels[offset]) + 10u;
+                                }
+                            }
+                            for (uint32_t y = 390u; y <= 434u; y += 4u)
+                            {
+                                for (uint32_t x = 50u; x <= 359u; x += 4u)
+                                {
+                                    const size_t offset = (static_cast<size_t>(y) * width + x) * 4u;
+                                    lastDuelBottomDark += duelVisualPixels[offset] < 110u &&
+                                        duelVisualPixels[offset + 1u] < 120u &&
+                                        duelVisualPixels[offset + 2u] < 140u;
+                                }
+                            }
+                            if (lastDuelTopBlue >= 100u && lastDuelBottomDark >= 500u)
+                            {
+                                automatedDuelVisualTriggerFrame = copiedGeneration;
+                                std::cout << "[automated-input] Duel start visual cue at host frame "
+                                          << hostFrame << " presented frame " << copiedGeneration
+                                          << " top_blue=" << lastDuelTopBlue
+                                          << " bottom_dark=" << lastDuelBottomDark << std::endl;
+                            }
+                        }
+                    }
+                }
+                if (automatedDuelVisualTriggerFrame == 0u &&
+                    duelInputFrame >= automatedDuelStartFrame + 900u)
+                {
+                    reportedAutomatedVisualTimeout = true;
+                    std::cout << "[automated-input] Duel start visual cue timed out at host frame "
+                              << hostFrame << " presented frame " << presentedFrame
+                              << " top_blue=" << lastDuelTopBlue
+                              << " bottom_dark=" << lastDuelBottomDark << std::endl;
+                }
+            }
+            const uint64_t levelSelectFrame = automatedDuelVisualRoute
+                ? duelRouteSelectFrame : automatedLevelSelectFrame;
+            const uint64_t levelConfirmFrame = automatedDuelVisualRoute
+                ? duelRouteConfirmFrame : automatedLevelConfirmFrame;
+            const bool pressLevelSelect = automatedLevelSelect && levelSelectFrame != 0u &&
+                duelInputFrame >= levelSelectFrame &&
+                duelInputFrame < levelSelectFrame + duelPressDuration;
+            const bool pressLevelConfirm = automatedLevelSelect && levelConfirmFrame != 0u &&
+                duelInputFrame >= levelConfirmFrame &&
+                duelInputFrame < levelConfirmFrame + duelPressDuration;
+            const uint64_t duelStartFrame = automatedDuelVisualStart
+                ? automatedDuelVisualTriggerFrame : automatedDuelStartFrame;
+            const bool pressDuelStart = automatedLevelSelect && duelStartFrame != 0u &&
+                duelInputFrame >= duelStartFrame &&
+                duelInputFrame < duelStartFrame + duelPressDuration;
+            const auto routePulse = [&](uint64_t firstFrame, uint32_t stage) {
+                return automatedDuelVisualRoute && duelRouteStage == stage &&
+                       firstFrame != 0u && duelInputFrame >= firstFrame &&
+                       ((duelInputFrame - firstFrame) % 90u) < duelPressDuration;
+            };
             const bool pressCross =
-                pressLevelSelect ||
+                pressLevelSelect || pressLevelConfirm || pressDuelStart ||
                 (automatedNewGame && hostFrame >= automatedNewGameFrame &&
                  ((hostFrame - automatedNewGameFrame) % 120u) < 6u) ||
-                (automatedContinue &&
-                 ((hostFrame >= automatedContinueFrame + 60u &&
-                   hostFrame < automatedContinueFrame + 66u) ||
-                  (hostFrame >= automatedContinueFrame + 600u &&
-                   hostFrame < automatedContinueFrame + 606u)));
-            const bool pressDown =
-                automatedContinue && hostFrame >= automatedContinueFrame &&
+                (routePulse(duelRouteContinueFrame, 2u) &&
+                 duelRouteContinueVisible && !duelRoutePopupVisible) ||
+                (routePulse(duelRouteDismissFrame, 3u) &&
+                 duelRouteContinueVisible && duelRoutePopupVisible) ||
+                (automatedContinue && !automatedDuelVisualRoute &&
+                 ((hostFrame >= automatedContinueFrame + 240u &&
+                   hostFrame < automatedContinueFrame + 246u) ||
+                  (hostFrame >= automatedContinueFrame + 780u &&
+                   hostFrame < automatedContinueFrame + 786u)));
+            const bool pressDown = automatedDuelVisualRoute
+                ? (routePulse(duelRouteDownFrame, 1u) && duelRouteMenuNewVisible)
+                : (automatedContinue && hostFrame >= automatedContinueFrame + 180u &&
+                   hostFrame < automatedContinueFrame + 186u);
+            const bool pressContinueStart =
+                automatedContinue && !automatedDuelVisualRoute &&
+                hostFrame >= automatedContinueFrame &&
                 hostFrame < automatedContinueFrame + 6u;
             const bool pulseAutomatedStart =
-                automatedStart && hostFrame >= 120u &&
+                (automatedStart || (automatedContinue &&
+                                    (automatedDuelVisualRoute ? duelRouteStage == 0u :
+                                     hostFrame < automatedContinueFrame))) &&
+                hostFrame >= 120u &&
                 ((hostFrame - 120u) % 120u) < 6u;
             const bool pressStart =
                 !pressCross && !pressDown &&
-                (pulseAutomatedStart ||
-                 (!automatedStart && hostFrame >= 120u && hostFrame < 126u));
+                (pulseAutomatedStart || pressContinueStart ||
+                 (automatedNewGame && hostFrame >= 120u && hostFrame < 126u));
             if (pressCross)
             {
                 ps2_stubs::setPadOverrideState(0xBFFFu, 0x80u, 0x80u, 0x80u, 0x80u);
+                if (automatedDuelVisualRoute && duelInputFrame != duelRouteLastRetryLogFrame &&
+                    ((duelRouteStage == 2u && duelInputFrame > duelRouteContinueFrame &&
+                      (duelInputFrame - duelRouteContinueFrame) % 90u == 0u) ||
+                     (duelRouteStage == 3u && duelInputFrame > duelRouteDismissFrame &&
+                      (duelInputFrame - duelRouteDismissFrame) % 90u == 0u)))
+                {
+                    duelRouteLastRetryLogFrame = duelInputFrame;
+                    std::cout << "[automated-input] Duel route retry Cross at stage "
+                              << duelRouteStage << " presented frame " << duelInputFrame
+                              << std::endl;
+                }
                 if (pressLevelSelect && !reportedAutomatedLevelSelect)
                 {
                     std::cout << "[automated-input] Enemy level selected at host frame "
-                              << hostFrame << std::endl;
+                              << hostFrame << " presented frame " << presentedFrame << std::endl;
                     reportedAutomatedLevelSelect = true;
+                }
+                if (pressLevelConfirm && !reportedAutomatedLevelConfirm)
+                {
+                    std::cout << "[automated-input] Duel confirmed at host frame "
+                              << hostFrame << " presented frame " << presentedFrame << std::endl;
+                    reportedAutomatedLevelConfirm = true;
+                }
+                if (pressDuelStart)
+                {
+                    if (!reportedAutomatedDuelStart)
+                    {
+                        std::cout << "[automated-input] Duel start pressed at host frame "
+                                  << hostFrame << " presented frame " << presentedFrame << std::endl;
+                        reportedAutomatedDuelStart = true;
+                    }
                 }
                 if (!reportedAutomatedCross)
                 {
@@ -3267,6 +3907,14 @@ void PS2Runtime::run()
             else if (pressDown)
             {
                 ps2_stubs::setPadOverrideState(0xFFBFu, 0x80u, 0x80u, 0x80u, 0x80u);
+                if (automatedDuelVisualRoute && duelInputFrame != duelRouteLastRetryLogFrame &&
+                    duelInputFrame > duelRouteDownFrame &&
+                    (duelInputFrame - duelRouteDownFrame) % 90u == 0u)
+                {
+                    duelRouteLastRetryLogFrame = duelInputFrame;
+                    std::cout << "[automated-input] Duel route retry Down at presented frame "
+                              << duelInputFrame << std::endl;
+                }
                 if (!reportedAutomatedDown)
                 {
                     std::cout << "[automated-input] Down pressed at host frame " << hostFrame << std::endl;
@@ -3301,6 +3949,7 @@ void PS2Runtime::run()
                 uint64_t curVuPairs = m_vu1.instructionPairCount();
                 uint64_t curXgkick = m_vu1.xgkickCount();
                 const auto vuStop = static_cast<uint32_t>(m_vu1.lastStopReason());
+                m_gifArbiter.drain();
                 const GSRegisters &gs = m_memory.gs();
                 const uint32_t dbgPc = m_debugPc.load(std::memory_order_relaxed);
                 const uint32_t dbgRa = m_debugRa.load(std::memory_order_relaxed);
@@ -3340,9 +3989,142 @@ void PS2Runtime::run()
                                                << std::endl);
             }
         });
+        if (gpuPointReady)
+        {
+            GsGpuPointQueue::Ticket request;
+            for (size_t served = 0u; served < 64u && m_gsGpuPointQueue.tryPop(request); ++served)
+            {
+                uint32_t result = 0u;
+                const bool succeeded = renderOpaqueGpuPoint(request->rgba32, result);
+                if (succeeded)
+                    gpuPointReadbacks.fetch_add(1u, std::memory_order_relaxed);
+                m_gsGpuPointQueue.complete(request, succeeded, result);
+            }
+            if ((hostFrame % 120u) == 0u)
+                std::cout << "[gs-gpu-point] requests=" << gpuPointRequests.load()
+                          << " readbacks=" << gpuPointReadbacks.load()
+                          << " accepted=" << gpuPointCommits.load() << std::endl;
+        }
+        if (samplerStatsEnabled && (hostFrame % 120u) == 0u)
+        {
+            const GsSamplerStats stats = m_gs.samplerStats();
+            std::cout << "[gs-sampler] triangles=" << stats.texturedTriangles
+                      << " eligible_triangles=" << stats.eligibleTriangles
+                      << " samples=" << stats.texturedSamples
+                      << " fast_samples=" << stats.fastSamples << std::endl;
+        }
+        if (pixelStateStatsEnabled && (hostFrame % 120u) == 0u)
+        {
+            const GsPixelStateStats stats = m_gs.pixelStateStats();
+            const uint64_t knownFrame = stats.framePsm[GS_PSM_CT32] + stats.framePsm[GS_PSM_CT24] +
+                stats.framePsm[GS_PSM_CT16] + stats.framePsm[GS_PSM_CT16S];
+            const uint64_t knownDepth = stats.depthPsm[GS_PSM_Z32] + stats.depthPsm[GS_PSM_Z24] +
+                stats.depthPsm[GS_PSM_Z16] + stats.depthPsm[GS_PSM_Z16S];
+            const uint64_t knownTexture = stats.texturePsm[GS_PSM_CT32] + stats.texturePsm[GS_PSM_CT24] +
+                stats.texturePsm[GS_PSM_CT16] + stats.texturePsm[GS_PSM_CT16S] +
+                stats.texturePsm[GS_PSM_T8] + stats.texturePsm[GS_PSM_T4] +
+                stats.texturePsm[GS_PSM_T8H] + stats.texturePsm[GS_PSM_T4HL] +
+                stats.texturePsm[GS_PSM_T4HH];
+            std::cout << "[gs-pixel-state] covered=" << stats.coveredPixels
+                      << " frame_ct32=" << stats.framePsm[GS_PSM_CT32]
+                      << " frame_ct24=" << stats.framePsm[GS_PSM_CT24]
+                      << " frame_ct16=" << stats.framePsm[GS_PSM_CT16] + stats.framePsm[GS_PSM_CT16S]
+                      << " frame_other=" << stats.coveredPixels - knownFrame
+                      << " depth_z32=" << stats.depthPsm[GS_PSM_Z32]
+                      << " depth_z24=" << stats.depthPsm[GS_PSM_Z24]
+                      << " depth_z16=" << stats.depthPsm[GS_PSM_Z16] + stats.depthPsm[GS_PSM_Z16S]
+                      << " depth_other=" << stats.coveredPixels - knownDepth
+                      << " ztst_never=" << stats.ztst[0]
+                      << " ztst_always=" << stats.ztst[1]
+                      << " ztst_gequal=" << stats.ztst[2]
+                      << " ztst_greater=" << stats.ztst[3]
+                      << " zmask=" << stats.zmask[1]
+                      << " abe=" << stats.abe[1]
+                      << " ate=" << stats.alphaTest[1]
+                      << " date=" << stats.date[1]
+                      << " fbmsk=" << stats.fbmsk[1]
+                      << " untextured=" << stats.untextured
+                      << " tex_ct32=" << stats.texturePsm[GS_PSM_CT32]
+                      << " tex_ct24=" << stats.texturePsm[GS_PSM_CT24]
+                      << " tex_ct16=" << stats.texturePsm[GS_PSM_CT16] + stats.texturePsm[GS_PSM_CT16S]
+                      << " tex_t8=" << stats.texturePsm[GS_PSM_T8] + stats.texturePsm[GS_PSM_T8H]
+                      << " tex_t4=" << stats.texturePsm[GS_PSM_T4] + stats.texturePsm[GS_PSM_T4HL] + stats.texturePsm[GS_PSM_T4HH]
+                      << " tex_other=" << stats.coveredPixels - stats.untextured - knownTexture
+                      << " alpha_reject=" << stats.alphaRejected
+                      << " alpha_discard=" << stats.alphaDiscarded
+                      << " date_reject=" << stats.dateRejected
+                      << " depth_reject=" << stats.depthRejected
+                      << " fb_reads=" << stats.framebufferReads
+                      << " z_reads=" << stats.depthReads
+                      << " fb_writes=" << stats.framebufferWrites
+                      << " z_writes=" << stats.depthWrites << std::endl;
+        }
+        try
+        {
+            (void)pumpGsRenderCommands(m_gs, m_gsRenderQueue, 64u);
+        }
+        catch (const std::exception &error)
+        {
+            m_gsRenderQueue.fail(error.what());
+            RUNTIME_LOG("[gs-owner-pump] disabled after failure: " << error.what());
+        }
+        catch (...)
+        {
+            m_gsRenderQueue.fail("unknown host pump failure");
+            RUNTIME_LOG("[gs-owner-pump] disabled after unknown failure");
+        }
+
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
         UploadFrame(frameTex, this, presentWidth, presentHeight);
+
+        const auto performanceNow = std::chrono::steady_clock::now();
+        if (performanceMetrics && performanceNow >= nextPerformanceSample)
+        {
+            const GSDebugSnapshot gsPerformance = m_gs.getDebugSnapshot();
+            const GSFrameIntervalSnapshot frameIntervals = performanceFrameIntervalsEnabled
+                ? m_gs.consumeHostPresentationFrameIntervals() : GSFrameIntervalSnapshot{};
+            const double elapsedSeconds =
+                std::chrono::duration<double>(performanceNow - performanceStart).count();
+            const int64_t utcEpochMilliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            performanceMetrics << std::fixed << std::setprecision(3) << elapsedSeconds
+                               << '\t' << utcEpochMilliseconds
+                               << '\t' << hostFrame
+                               << '\t' << m_gs.hostPresentationGeneration()
+                               << '\t' << m_performanceGuestDispatches.load(std::memory_order_relaxed)
+                               << '\t' << gsPerformance.drawCount
+                               << '\t' << gsPerformance.transferCount
+                               << '\t' << m_vu0.runCount()
+                               << '\t' << m_vu0.instructionPairCount()
+                               << '\t' << m_vu1.runCount()
+                               << '\t' << m_vu1.instructionPairCount()
+                               << "\t0x" << std::hex << m_debugPc.load(std::memory_order_relaxed)
+                               << "\t0x" << m_debugRa.load(std::memory_order_relaxed)
+                               << "\t0x" << m_debugSp.load(std::memory_order_relaxed)
+                               << "\t0x" << m_debugGp.load(std::memory_order_relaxed)
+                               << std::dec
+                               << '\t' << guestExecutionHandoffEpochSnapshot()
+                               << '\t' << guestExecutionHandoffTimeouts()
+                               << '\t' << (m_performanceLockTimingEnabled ? 1 : 0)
+                               << '\t' << m_performanceLockWaitNanoseconds.load(std::memory_order_relaxed)
+                               << '\t' << m_performanceLockSamples.load(std::memory_order_relaxed)
+                               << '\t' << frameIntervals.count
+                               << '\t' << frameIntervals.dropped
+                               << '\t';
+            for (size_t i = 0; i < frameIntervals.count; ++i)
+            {
+                if (i != 0u)
+                    performanceMetrics << ';';
+                performanceMetrics << frameIntervals.microseconds[i];
+            }
+            performanceMetrics << '\n';
+            performanceMetrics.flush();
+            do
+            {
+                nextPerformanceSample += std::chrono::seconds(1);
+            } while (nextPerformanceSample <= performanceNow);
+        }
 
 #if !defined(PLATFORM_VITA)
         // F8 saves the bounded diagnostic history without enabling continuous
@@ -3419,6 +4201,7 @@ void PS2Runtime::run()
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
         EndDrawing();
+        m_audioBackend.pump();
 
         if (WindowShouldClose())
         {
@@ -3482,12 +4265,29 @@ void PS2Runtime::run()
         ps2_syscalls::detachAllGuestHostThreads();
     }
 
+    // Let GIF work finish, then disable GS-side enqueueing atomically before
+    // closing the queue. close() keeps already-accepted commands pumpable.
+    m_gsGpuPointQueue.close();
+    m_gifArbiter.drain();
+    m_gs.setGpuPointExecutor({});
+    if (gpuPointReady)
+        std::cout << "[gs-gpu-point] requests=" << gpuPointRequests.load()
+                  << " readbacks=" << gpuPointReadbacks.load()
+                  << " accepted=" << gpuPointCommits.load() << std::endl;
+    m_gs.setOwnerPumpQueue(nullptr, false);
+    m_gsRenderQueue.close();
+    while (pumpGsRenderCommands(m_gs, m_gsRenderQueue, 256u).completed != 0u)
+    {
+    }
+
     if (m_debugUiInitialized && m_debugUiShutdownCallback)
     {
         m_debugUiShutdownCallback(*this, m_debugUiUserData);
         m_debugUiInitialized = false;
     }
     UnloadTexture(frameTex);
+    if (gpuPointReady)
+        UnloadRenderTexture(gpuPointTarget);
     CloseWindow();
 
     const int remainingThreads = g_activeThreads.load(std::memory_order_relaxed);

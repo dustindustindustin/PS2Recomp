@@ -2,6 +2,7 @@
 #define PS2_GS_GPU_H
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <functional>
 #include <cstdint>
@@ -11,6 +12,36 @@
 
 #include "ps2_gs_rasterizer.h"
 #include "ps2_gs_memory.h"
+
+class GsRenderCommandQueue;
+
+struct GSVramByteRange
+{
+    uint32_t offset = 0u;
+    uint32_t sizeBytes = 0u;
+};
+
+enum class GSVramAccessKind : uint8_t
+{
+    Read,
+    Write,
+};
+
+struct GSVramRangeVersionSnapshot
+{
+    uint32_t offset = 0u;
+    uint32_t sizeBytes = 0u;
+    uint64_t trackerGeneration = 0u;
+    std::vector<uint64_t> blockVersions;
+    bool valid = false;
+};
+
+struct GSVramOperationAccesses
+{
+    uint64_t operationSequence = 0u;
+    std::vector<GSVramByteRange> readRanges;
+    std::vector<GSVramByteRange> writeRanges;
+};
 
 enum GSPrimType : uint8_t
 {
@@ -203,6 +234,63 @@ struct GSPrimReg
     bool fix;
 };
 
+// Value snapshot of the GS state needed to rasterize one completed primitive.
+// VRAM itself remains externally owned and is accessed through GS's memory
+// helpers while the caller holds the GS state lock.
+struct GSPrimitiveSubmission
+{
+    GSContext context{};
+    GSPrimReg prim{};
+    std::array<GSVertex, 6> vertices{};
+    GSTexaReg texa{};
+    GSTexClutReg texclut{};
+    std::array<uint16_t, 512> clut{};
+    std::array<std::array<int8_t, 4>, 4> dimx{};
+    bool dthe = false;
+    bool colclamp = false;
+    bool pabe = false;
+    uint8_t fogR = 0;
+    uint8_t fogG = 0;
+    uint8_t fogB = 0;
+    bool hasPreferredDisplaySource = false;
+    uint32_t preferredDisplayDestFbp = 0;
+};
+
+struct GSPrimitiveEffects
+{
+    bool clearPreferredDisplaySource = false;
+    bool setPreferredDisplaySource = false;
+    GSFrameReg preferredDisplaySourceFrame{};
+    uint32_t preferredDisplayDestFbp = 0;
+};
+
+struct GSWriteRange
+{
+    uint32_t offset = 0u;
+    uint32_t sizeBytes = 0u;
+};
+
+enum class GSSubmissionDiagnosticStatus : uint8_t
+{
+    Disabled,
+    UnsupportedState,
+    Compared,
+    ReplayMismatch,
+    ReplayFailed,
+};
+
+struct GSSubmissionDiagnostic
+{
+    static constexpr size_t kMaxWriteRanges = 128u;
+    uint64_t operationSequence = 0u;
+    GSSubmissionDiagnosticStatus status = GSSubmissionDiagnosticStatus::Disabled;
+    uint32_t changedByteCount = 0u;
+    uint32_t mismatchByteCount = 0u;
+    uint32_t writeRangeCount = 0u;
+    bool writeRangeOverflow = false;
+    std::array<GSWriteRange, kMaxWriteRanges> writeRanges{};
+};
+
 struct GSBitBltBuf
 {
     uint32_t sbp;
@@ -318,6 +406,16 @@ struct GSDebugHistoryEntry
 
 class GSRasterizer;
 
+// Bounded guest-presentation intervals. A host metrics sample consumes the
+// ring once per second; no allocation is performed when a frame is published.
+struct GSFrameIntervalSnapshot
+{
+    static constexpr size_t Capacity = 2048;
+    std::array<uint64_t, Capacity> microseconds{};
+    size_t count = 0;
+    uint64_t dropped = 0;
+};
+
 class GS
 {
     friend class GSRasterizer;
@@ -327,7 +425,31 @@ public:
     ~GS() = default;
 
     void init(uint8_t *vram, uint32_t vramSize, struct GSRegisters *privRegs = nullptr);
+    bool copyVramBytes(size_t offset, void *dst, size_t sizeBytes) const;
+    bool writeVramBytes(size_t offset, const void *src, size_t sizeBytes);
+    bool fillVramBytes(size_t offset, uint8_t value, size_t sizeBytes);
+    uint32_t readVramPixel(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
+    void writeVramPixel(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
+    uint64_t operationSequence() const;
+    bool commitCT32PointPatch(uint64_t expectedOperationSequence, uint32_t destinationByteOffset, uint32_t rgba32);
+    void setVramAccessTrackingEnabled(bool enabled);
+    bool vramAccessTrackingEnabled() const;
+    GSVramOperationAccesses vramOperationAccesses(uint64_t operationSequence) const;
+    GSVramRangeVersionSnapshot captureVramRangeVersion(uint32_t offset, uint32_t sizeBytes) const;
+    bool isVramRangeVersionCurrent(const GSVramRangeVersionSnapshot &snapshot) const;
+    void setSubmissionDiagnosticsEnabled(bool enabled);
+    GSSubmissionDiagnostic lastSubmissionDiagnostic() const;
+    void setOwnerPumpQueue(GsRenderCommandQueue *queue, bool enabled);
+    // Called under the GS state lock. A true result must be a completed GPU
+    // readback; false falls back to the software rasterizer in the same draw.
+    void setGpuPointExecutor(std::function<bool(uint32_t, uint32_t &)> executor);
+    void setFastFstPointSamplingEnabled(bool enabled);
+    void setSamplerStatsEnabled(bool enabled);
+    GsSamplerStats samplerStats() const;
+    void setPixelStateStatsEnabled(bool enabled);
+    GsPixelStateStats pixelStateStats() const;
     void reset();
+    GSPrimitiveSubmission capturePrimitiveSubmission() const;
 
     void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
     bool processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes);
@@ -366,6 +488,8 @@ public:
                                           bool *outUsedPreferred = nullptr,
                                           uint64_t *outGeneration = nullptr) const;
     uint64_t hostPresentationGeneration() const;
+    void setFrameIntervalTelemetryEnabled(bool enabled);
+    GSFrameIntervalSnapshot consumeHostPresentationFrameIntervals();
     bool clearFramebufferContext(uint32_t contextIndex, uint32_t rgba);
     bool clearActiveFramebuffer(uint32_t rgba);
     uint64_t nativeImageUploadCount() const { return m_nativeImageUploadCount; }
@@ -375,10 +499,20 @@ public:
 
     void refreshDisplaySnapshot();
 
-    inline void WriteVram(u32 psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
-    inline u32 ReadVram(u32 psm, u32 base, u32 bw, u32 x, u32 y) const;
-
 private:
+    // Pixel handlers are lock-free and private. Rasterization and GS command
+    // processing already hold m_stateMutex; external inspection uses the
+    // synchronized byte-copy or pixel-read APIs above.
+    inline void WriteVram(u32 psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
+    inline u32 ReadVram(u32 psm, u32 base, u32 bw, uint32_t x, uint32_t y) const;
+    void beginOperationUnlocked();
+    void recordVramAccessUnlocked(uint32_t offset, uint32_t sizeBytes, GSVramAccessKind kind) const;
+    std::vector<GSVramByteRange> collectVramOperationRangesUnlocked(uint64_t operationSequence,
+                                                                    GSVramAccessKind kind) const;
+    bool copyVramRangeUnlocked(size_t offset, void *dst, size_t sizeBytes) const;
+    bool isDiagnosticPointEligible(const GSPrimitiveSubmission &submission) const;
+    void recordSubmissionDiagnostic(const GSPrimitiveSubmission &submission,
+                                    const std::vector<uint8_t> &beforeVram);
     void snapshotVRAM();
     void writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi);
     void vertexKick(bool drawing);
@@ -420,6 +554,19 @@ private:
     uint32_t m_vramSize = 0;
     struct GSRegisters *m_privRegs = nullptr;
     mutable std::recursive_mutex m_stateMutex;
+    uint64_t m_operationSequence = 0u;
+    static constexpr uint32_t kVramTrackingGranularity = 64u;
+    bool m_vramAccessTrackingEnabled = false;
+    uint64_t m_vramTrackingGeneration = 0u;
+    mutable bool m_vramAccessTrackingSuppressed = false;
+    mutable std::vector<uint64_t> m_vramBlockVersions;
+    mutable std::vector<uint64_t> m_vramReadOperationStamps;
+    mutable std::vector<uint64_t> m_vramWriteOperationStamps;
+    bool m_submissionDiagnosticsEnabled = false;
+    GSSubmissionDiagnostic m_lastSubmissionDiagnostic{};
+    GsRenderCommandQueue *m_ownerPumpQueue = nullptr;
+    bool m_ownerPumpQueueEnabled = false;
+    std::function<bool(uint32_t, uint32_t &)> m_gpuPointExecutor;
 
     GSContext m_ctx[2];
     GSPrimReg m_prim{};
@@ -477,6 +624,13 @@ private:
     bool m_hostPresentationUsedPreferred = false;
     bool m_hasHostPresentationFrame = false;
     uint64_t m_hostPresentationGeneration = 0u;
+    bool m_frameIntervalTelemetryEnabled = false;
+    std::chrono::steady_clock::time_point m_lastFramePublicationTime{};
+    bool m_hasLastFramePublicationTime = false;
+    std::array<uint64_t, GSFrameIntervalSnapshot::Capacity> m_frameIntervalMicroseconds{};
+    size_t m_frameIntervalWrite = 0;
+    size_t m_frameIntervalCount = 0;
+    uint64_t m_frameIntervalsDropped = 0;
     uint64_t m_nativeImageUploadCount = 0;
     uint64_t m_nativePackedGIFPacketCount = 0;
     uint64_t m_gifPacketCount = 0;
@@ -498,8 +652,8 @@ private:
 
     GSRasterizer m_rasterizer;
 
-    using WriteVramFunc = std::function<void(u8*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t)>;
-    using ReadVramFunc = std::function<u32(u8*, u32, u32, u32, u32)>;
+    using WriteVramFunc = void (*)(u8*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+    using ReadVramFunc = u32 (*)(u8*, u32, u32, u32, u32);
 
     static constexpr size_t kPsmHandlerCount = 1u << 6u;
     std::array<ReadVramFunc, kPsmHandlerCount> m_read_vram_funcs{ };
@@ -508,12 +662,31 @@ private:
 
 inline u32 GS::ReadVram(u32 psm, u32 base, u32 bw, u32 x, u32 y) const
 {
-    return m_read_vram_funcs[psm & 0x3F](m_vram, base, bw, x, y);
+    const u32 mode = psm & 0x3Fu;
+    const u32 value = m_read_vram_funcs[mode](m_vram, base, bw, x, y);
+    if (m_vramAccessTrackingEnabled && !m_vramAccessTrackingSuppressed)
+    {
+        GSMem::PixelByteRange range{};
+        if (GSMem::GetPixelByteRange(mode, base, bw, x, y, range))
+            recordVramAccessUnlocked(range.offset, range.sizeBytes, GSVramAccessKind::Read);
+    }
+    return value;
 }
 
 inline void GS::WriteVram(u32 psm, u32 base, u32 bw, u32 x, u32 y, u32 value)
 {
-    m_write_vram_funcs[psm & 0x3F](m_vram, base, bw, x, y, value);
+    const u32 mode = psm & 0x3Fu;
+    m_write_vram_funcs[mode](m_vram, base, bw, x, y, value);
+    if (m_vramAccessTrackingEnabled && !m_vramAccessTrackingSuppressed)
+    {
+        GSMem::PixelByteRange range{};
+        if (GSMem::GetPixelByteRange(mode, base, bw, x, y, range))
+        {
+            if (range.readModifyWrite)
+                recordVramAccessUnlocked(range.offset, range.sizeBytes, GSVramAccessKind::Read);
+            recordVramAccessUnlocked(range.offset, range.sizeBytes, GSVramAccessKind::Write);
+        }
+    }
 }
 
 #endif

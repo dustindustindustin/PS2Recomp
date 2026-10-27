@@ -13,6 +13,13 @@ namespace GSMem
 	constexpr usz MEMORY_SIZE = 4_mb;
 	constexpr usz GS_PAGE_SIZE = 8_kb;
 
+	struct PixelByteRange
+	{
+		u32 offset = 0u;
+		u32 sizeBytes = 0u;
+		bool readModifyWrite = false;
+	};
+
 	// these are all the same regardless of storage mode
 	constexpr usz BLOCKS_PER_PAGE = 32;
 	constexpr usz COLUMNS_PER_BLOCK = 4;
@@ -537,6 +544,9 @@ namespace GSMem
 	}
 
 	void InitLookupTables();
+	// Returns the physical bytes touched by one pixel access, including packed
+	// pixel read-modify-write storage and the GS VRAM wrap used by the handlers.
+	bool GetPixelByteRange(u32 psm, u32 bp, u32 bw, u32 x, u32 y, PixelByteRange &outRange);
 
 	void WriteCT32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
 	void WriteZ32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);

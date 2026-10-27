@@ -378,19 +378,19 @@ void SetGsForceBilinearTextures(bool enabled)
     g_forceBilinearTextures.store(enabled, std::memory_order_relaxed);
 }
 
-void GSRasterizer::drawPrimitive(GS *gs)
+GSPrimitiveEffects GSRasterizer::drawPrimitive(GS *gs, const GSPrimitiveSubmission &submission)
 {
-    const auto &ctx = gs->activeContext();
+    const auto &ctx = submission.context;
     PS2_IF_AGRESSIVE_LOGS({
         const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);
         if (primitiveIndex < 64u)
         {
             std::cout << "[gs:prim] idx=" << primitiveIndex
-                      << " type=" << static_cast<uint32_t>(gs->m_prim.type)
-                      << " tme=" << static_cast<uint32_t>(gs->m_prim.tme)
-                      << " abe=" << static_cast<uint32_t>(gs->m_prim.abe)
-                      << " fst=" << static_cast<uint32_t>(gs->m_prim.fst)
-                      << " ctxt=" << static_cast<uint32_t>(gs->m_prim.ctxt)
+                      << " type=" << static_cast<uint32_t>(submission.prim.type)
+                      << " tme=" << static_cast<uint32_t>(submission.prim.tme)
+                      << " abe=" << static_cast<uint32_t>(submission.prim.abe)
+                      << " fst=" << static_cast<uint32_t>(submission.prim.fst)
+                      << " ctxt=" << static_cast<uint32_t>(submission.prim.ctxt)
                       << " fbp=" << ctx.frame.fbp
                       << " fbw=" << ctx.frame.fbw
                       << " psm=0x" << std::hex << static_cast<uint32_t>(ctx.frame.psm) << std::dec
@@ -408,9 +408,9 @@ void GSRasterizer::drawPrimitive(GS *gs)
                       << " csa=" << static_cast<uint32_t>(ctx.tex0.csa)
                       << ")"
                       << " texclut=("
-                      << "cbw=" << static_cast<uint32_t>(gs->m_texclut.cbw)
-                      << " cou=" << static_cast<uint32_t>(gs->m_texclut.cou)
-                      << " cov=" << gs->m_texclut.cov
+                      << "cbw=" << static_cast<uint32_t>(submission.texclut.cbw)
+                      << " cou=" << static_cast<uint32_t>(submission.texclut.cou)
+                      << " cov=" << submission.texclut.cov
                       << ")"
                       << " ofx=" << (ctx.xyoffset.ofx >> 4)
                       << " ofy=" << (ctx.xyoffset.ofy >> 4)
@@ -421,41 +421,41 @@ void GSRasterizer::drawPrimitive(GS *gs)
                       << " test=0x" << std::hex << ctx.test
                       << " alpha=0x" << ctx.alpha
                       << std::dec
-                      << " v0=(" << gs->m_vtxQueue[0].x << "," << gs->m_vtxQueue[0].y << ")"
-                      << " uv0=(" << (gs->m_vtxQueue[0].u >> 4) << "," << (gs->m_vtxQueue[0].v >> 4) << ")"
-                      << " stq0=(" << gs->m_vtxQueue[0].s << "," << gs->m_vtxQueue[0].t << "," << gs->m_vtxQueue[0].q << ")"
-                      << " v1=(" << gs->m_vtxQueue[1].x << "," << gs->m_vtxQueue[1].y << ")"
-                      << " uv1=(" << (gs->m_vtxQueue[1].u >> 4) << "," << (gs->m_vtxQueue[1].v >> 4) << ")"
-                      << " stq1=(" << gs->m_vtxQueue[1].s << "," << gs->m_vtxQueue[1].t << "," << gs->m_vtxQueue[1].q << ")"
-                      << " v2=(" << gs->m_vtxQueue[2].x << "," << gs->m_vtxQueue[2].y << ")"
-                      << " uv2=(" << (gs->m_vtxQueue[2].u >> 4) << "," << (gs->m_vtxQueue[2].v >> 4) << ")"
-                      << " stq2=(" << gs->m_vtxQueue[2].s << "," << gs->m_vtxQueue[2].t << "," << gs->m_vtxQueue[2].q << ")"
-                      << " rgba0=(" << static_cast<uint32_t>(gs->m_vtxQueue[0].r) << ","
-                      << static_cast<uint32_t>(gs->m_vtxQueue[0].g) << ","
-                      << static_cast<uint32_t>(gs->m_vtxQueue[0].b) << ","
-                      << static_cast<uint32_t>(gs->m_vtxQueue[0].a) << ")"
-                      << " rgba1=(" << static_cast<uint32_t>(gs->m_vtxQueue[1].r) << ","
-                      << static_cast<uint32_t>(gs->m_vtxQueue[1].g) << ","
-                      << static_cast<uint32_t>(gs->m_vtxQueue[1].b) << ","
-                      << static_cast<uint32_t>(gs->m_vtxQueue[1].a) << ")"
-                      << " rgba2=(" << static_cast<uint32_t>(gs->m_vtxQueue[2].r) << ","
-                      << static_cast<uint32_t>(gs->m_vtxQueue[2].g) << ","
-                      << static_cast<uint32_t>(gs->m_vtxQueue[2].b) << ","
-                      << static_cast<uint32_t>(gs->m_vtxQueue[2].a) << ")"
+                      << " v0=(" << submission.vertices[0].x << "," << submission.vertices[0].y << ")"
+                      << " uv0=(" << (submission.vertices[0].u >> 4) << "," << (submission.vertices[0].v >> 4) << ")"
+                      << " stq0=(" << submission.vertices[0].s << "," << submission.vertices[0].t << "," << submission.vertices[0].q << ")"
+                      << " v1=(" << submission.vertices[1].x << "," << submission.vertices[1].y << ")"
+                      << " uv1=(" << (submission.vertices[1].u >> 4) << "," << (submission.vertices[1].v >> 4) << ")"
+                      << " stq1=(" << submission.vertices[1].s << "," << submission.vertices[1].t << "," << submission.vertices[1].q << ")"
+                      << " v2=(" << submission.vertices[2].x << "," << submission.vertices[2].y << ")"
+                      << " uv2=(" << (submission.vertices[2].u >> 4) << "," << (submission.vertices[2].v >> 4) << ")"
+                      << " stq2=(" << submission.vertices[2].s << "," << submission.vertices[2].t << "," << submission.vertices[2].q << ")"
+                      << " rgba0=(" << static_cast<uint32_t>(submission.vertices[0].r) << ","
+                      << static_cast<uint32_t>(submission.vertices[0].g) << ","
+                      << static_cast<uint32_t>(submission.vertices[0].b) << ","
+                      << static_cast<uint32_t>(submission.vertices[0].a) << ")"
+                      << " rgba1=(" << static_cast<uint32_t>(submission.vertices[1].r) << ","
+                      << static_cast<uint32_t>(submission.vertices[1].g) << ","
+                      << static_cast<uint32_t>(submission.vertices[1].b) << ","
+                      << static_cast<uint32_t>(submission.vertices[1].a) << ")"
+                      << " rgba2=(" << static_cast<uint32_t>(submission.vertices[2].r) << ","
+                      << static_cast<uint32_t>(submission.vertices[2].g) << ","
+                      << static_cast<uint32_t>(submission.vertices[2].b) << ","
+                      << static_cast<uint32_t>(submission.vertices[2].a) << ")"
                       << std::endl;
         }
     });
 
     PS2_IF_AGRESSIVE_LOGS({
-        if ((gs->m_prim.ctxt != 0u || ctx.frame.fbp == 150u) &&
+        if ((submission.prim.ctxt != 0u || ctx.frame.fbp == 150u) &&
             s_debugContext1PrimitiveCount.fetch_add(1u, std::memory_order_relaxed) < 32u)
         {
             std::cout << "[gs:copy-prim]"
-                      << " type=" << static_cast<uint32_t>(gs->m_prim.type)
-                      << " tme=" << static_cast<uint32_t>(gs->m_prim.tme)
-                      << " abe=" << static_cast<uint32_t>(gs->m_prim.abe)
-                      << " fst=" << static_cast<uint32_t>(gs->m_prim.fst)
-                      << " ctxt=" << static_cast<uint32_t>(gs->m_prim.ctxt)
+                      << " type=" << static_cast<uint32_t>(submission.prim.type)
+                      << " tme=" << static_cast<uint32_t>(submission.prim.tme)
+                      << " abe=" << static_cast<uint32_t>(submission.prim.abe)
+                      << " fst=" << static_cast<uint32_t>(submission.prim.fst)
+                      << " ctxt=" << static_cast<uint32_t>(submission.prim.ctxt)
                       << " fbp=" << ctx.frame.fbp
                       << " fbw=" << ctx.frame.fbw
                       << " psm=0x" << std::hex << static_cast<uint32_t>(ctx.frame.psm) << std::dec
@@ -471,9 +471,9 @@ void GSRasterizer::drawPrimitive(GS *gs)
                       << " csa=" << static_cast<uint32_t>(ctx.tex0.csa)
                       << ")"
                       << " texclut=("
-                      << "cbw=" << static_cast<uint32_t>(gs->m_texclut.cbw)
-                      << " cou=" << static_cast<uint32_t>(gs->m_texclut.cou)
-                      << " cov=" << gs->m_texclut.cov
+                      << "cbw=" << static_cast<uint32_t>(submission.texclut.cbw)
+                      << " cou=" << static_cast<uint32_t>(submission.texclut.cou)
+                      << " cov=" << submission.texclut.cov
                       << ")"
                       << " ofx=" << (ctx.xyoffset.ofx >> 4)
                       << " ofy=" << (ctx.xyoffset.ofy >> 4)
@@ -487,46 +487,70 @@ void GSRasterizer::drawPrimitive(GS *gs)
         }
     });
 
-    if (gs->m_hasPreferredDisplaySource && ctx.frame.fbp == gs->m_preferredDisplayDestFbp)
-    {
-        gs->m_hasPreferredDisplaySource = false;
-    }
+    GSPrimitiveEffects effects{};
+    effects.clearPreferredDisplaySource =
+        submission.hasPreferredDisplaySource &&
+        ctx.frame.fbp == submission.preferredDisplayDestFbp;
 
-    switch (gs->m_prim.type)
+    switch (submission.prim.type)
     {
     case GS_PRIM_SPRITE:
-        drawSprite(gs);
+        drawSprite(gs, submission, effects);
         break;
     case GS_PRIM_TRIANGLE:
     case GS_PRIM_TRISTRIP:
     case GS_PRIM_TRIFAN:
-        drawTriangle(gs);
+        drawTriangle(gs, submission);
         break;
     case GS_PRIM_LINE:
     case GS_PRIM_LINESTRIP:
-        drawLine(gs);
+        drawLine(gs, submission);
         break;
     case GS_PRIM_POINT:
     {
-        const GSVertex &v = gs->m_vtxQueue[0];
-        const auto &ctx = gs->activeContext();
+        const GSVertex &v = submission.vertices[0];
+        const auto &ctx = submission.context;
         int px = static_cast<int>(v.x) - (ctx.xyoffset.ofx >> 4);
         int py = static_cast<int>(v.y) - (ctx.xyoffset.ofy >> 4);
-        writePixel(gs, px, py, static_cast<u32>(v.z), v.r, v.g, v.b, v.a, v.fog);
+        writePixel(gs, submission, px, py, static_cast<u32>(v.z), v.r, v.g, v.b, v.a, v.fog);
         break;
     }
     default:
         break;
     }
+    return effects;
 }
 
-void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog)
+void GSRasterizer::writePixel(GS *gs, const GSPrimitiveSubmission &submission,
+                              int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog)
 {
-    const auto &ctx = gs->activeContext();
+    const auto &ctx = submission.context;
     if (x < ctx.scissor.x0 || x > ctx.scissor.x1 || y < ctx.scissor.y0 || y > ctx.scissor.y1)
         return;
 
-    if (gs->m_prim.fge)
+    const bool countTrianglePixel = m_pixelStateStatsEnabled &&
+        (submission.prim.type == GS_PRIM_TRIANGLE ||
+         submission.prim.type == GS_PRIM_TRISTRIP ||
+         submission.prim.type == GS_PRIM_TRIFAN);
+    if (countTrianglePixel)
+    {
+        auto &stats = m_pixelStateStats;
+        ++stats.coveredPixels;
+        ++stats.framePsm[ctx.frame.psm & 63u];
+        ++stats.depthPsm[ctx.zbuf.psm & 63u];
+        ++stats.ztst[(ctx.test >> 17u) & 3u];
+        ++stats.zmask[ctx.zbuf.zmask ? 1u : 0u];
+        ++stats.abe[submission.prim.abe ? 1u : 0u];
+        ++stats.alphaTest[(ctx.test & 1u) != 0u ? 1u : 0u];
+        ++stats.date[(ctx.test & (1u << 14u)) != 0u ? 1u : 0u];
+        ++stats.fbmsk[ctx.frame.fbmsk != 0u ? 1u : 0u];
+        if (submission.prim.tme)
+            ++stats.texturePsm[ctx.tex0.psm & 63u];
+        else
+            ++stats.untextured;
+    }
+
+    if (submission.prim.fge)
     {
         const uint32_t inverseFog = 255u - fog;
         auto applyFog = [&](uint8_t input, uint8_t fogColor) -> uint8_t
@@ -534,9 +558,9 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
             return static_cast<uint8_t>(((static_cast<uint32_t>(fog) * input) >> 8) + ((inverseFog * fogColor) >> 8));
         };
 
-        r = applyFog(r, gs->m_fogR);
-        g = applyFog(g, gs->m_fogG);
-        b = applyFog(b, gs->m_fogB);
+        r = applyFog(r, submission.fogR);
+        g = applyFog(g, submission.fogG);
+        b = applyFog(b, submission.fogB);
     }
 
     const u32 fbp = GSInternal::framePageBaseToBlock(ctx.frame.fbp);
@@ -546,13 +570,17 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
     const u32 zpsm = ctx.zbuf.psm;
 
     const PixelWriteMask writeMask = classifyAlphaTest(ctx.test, a, static_cast<uint8_t>(fpsm));
+    if (countTrianglePixel && !passesAlphaTest(ctx.test, a))
+        ++m_pixelStateStats.alphaRejected;
     if (!writeMask.writesAnything())
     {
+        if (countTrianglePixel)
+            ++m_pixelStateStats.alphaDiscarded;
         return;
     }
 
     const uint32_t ztestMethod = static_cast<uint32_t>((ctx.test >> 17) & 3u);
-    const bool alphaBlendEnabled = gs->m_prim.abe;
+    const bool alphaBlendEnabled = submission.prim.abe;
     const bool preserveDestinationAlpha = writeMask.writeRgb && !writeMask.writeAlpha && fpsm == GS_PSM_CT32;
     const bool destinationAlphaTestNeedsRead = ((ctx.test >> 14) & 0x1u) != 0u && (fpsm == GS_PSM_CT32 || fpsm == GS_PSM_CT16 || fpsm == GS_PSM_CT16S);
 
@@ -564,6 +592,8 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
     u32 fbrgba = 0;
     if (frmw)
     {
+        if (countTrianglePixel)
+            ++m_pixelStateStats.framebufferReads;
         rawFramebufferPixel = gs->ReadVram(fpsm, fbp, fbw, x, y);
         fbrgba = rawFramebufferPixel;
 
@@ -580,6 +610,8 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
 
     if (!passesDestinationAlphaTest(ctx.test, static_cast<uint8_t>(fpsm), rawFramebufferPixel))
     {
+        if (countTrianglePixel)
+            ++m_pixelStateStats.dateRejected;
         return;
     }
 
@@ -594,10 +626,14 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
         zpass = true;
         break;
     case 2:
+        if (countTrianglePixel)
+            ++m_pixelStateStats.depthReads;
         storedZ = gs->ReadVram(zpsm, zbp, fbw, x, y);
         zpass = static_cast<uint32_t>(z) >= storedZ;
         break;
     case 3:
+        if (countTrianglePixel)
+            ++m_pixelStateStats.depthReads;
         storedZ = gs->ReadVram(zpsm, zbp, fbw, x, y);
         zpass = static_cast<uint32_t>(z) > storedZ;
         break;
@@ -605,6 +641,8 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
 
     if (!zpass)
     {
+        if (countTrianglePixel)
+            ++m_pixelStateStats.depthRejected;
         return;
     }
 
@@ -617,7 +655,7 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
         const int srcG = outputG;
         const int srcB = outputB;
 
-        if (gs->m_prim.abe)
+        if (submission.prim.abe)
         {
             int dr = fbrgba & 0xFF;
             int dg = (fbrgba >> 8) & 0xFF;
@@ -625,7 +663,7 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
             uint8_t da = (fbrgba >> 24) & 0xFF;
 
             // PABE disables alpha blending when the source alpha MSB is clear.
-            if (!(gs->m_pabe && (a & 0x80u) == 0u))
+            if (!(submission.pabe && (a & 0x80u) == 0u))
             {
                 uint64_t alphaReg = ctx.alpha;
                 uint8_t asel = alphaReg & 3;
@@ -666,17 +704,17 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
         // The GS retains the wide signed blend result until the final write
         // pipeline. RGBA16 dithering happens before COLCLAMP and 8-to-5-bit
         // format conversion; RGBA32/RGB24 ignore DTHE.
-        if (bitsPerPixel(fpsm) == 16 && gs->m_dthe)
+        if (bitsPerPixel(fpsm) == 16 && submission.dthe)
         {
-            const int dither = gs->m_dimx[static_cast<size_t>(y) & 3u][static_cast<size_t>(x) & 3u];
+            const int dither = submission.dimx[static_cast<size_t>(y) & 3u][static_cast<size_t>(x) & 3u];
             outputR += dither;
             outputG += dither;
             outputB += dither;
         }
 
-        r = finalizeColorChannel(outputR, gs->m_colclamp);
-        g = finalizeColorChannel(outputG, gs->m_colclamp);
-        b = finalizeColorChannel(outputB, gs->m_colclamp);
+        r = finalizeColorChannel(outputR, submission.colclamp);
+        g = finalizeColorChannel(outputG, submission.colclamp);
+        b = finalizeColorChannel(outputB, submission.colclamp);
 
         if (writeMask.writeAlpha && (ctx.fba & 0x1ull) != 0ull && ctx.frame.psm != GS_PSM_CT24)
         {
@@ -702,15 +740,20 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
         }
 
         gs->WriteVram(fpsm, fbp, fbw, x, y, pixel);
+        if (countTrianglePixel)
+            ++m_pixelStateStats.framebufferWrites;
     }
 
     if (writeMask.writeDepth && !ctx.zbuf.zmask)
     {
         gs->WriteVram(zpsm, zbp, fbw, x, y, z);
+        if (countTrianglePixel)
+            ++m_pixelStateStats.depthWrites;
     }
 }
 
 uint32_t GSRasterizer::lookupCLUT(GS *gs,
+                                  const GSPrimitiveSubmission &submission,
                                   uint8_t index,
                                   uint32_t cbp,
                                   uint8_t cpsm,
@@ -727,13 +770,13 @@ uint32_t GSRasterizer::lookupCLUT(GS *gs,
     case GS_PSM_CT32:
     case GS_PSM_CT24:
     {
-        const uint32_t raw = static_cast<uint32_t>(gs->m_clut[clutIndex & 0xFFu]) |
-                             (static_cast<uint32_t>(gs->m_clut[(clutIndex & 0xFFu) + 256u]) << 16u);
-        return applyTexa(gs->m_texa, cpsm, raw);
+        const uint32_t raw = static_cast<uint32_t>(submission.clut[clutIndex & 0xFFu]) |
+                             (static_cast<uint32_t>(submission.clut[(clutIndex & 0xFFu) + 256u]) << 16u);
+        return applyTexa(submission.texa, cpsm, raw);
     }
     case GS_PSM_CT16:
     case GS_PSM_CT16S:
-        return applyTexa(gs->m_texa, cpsm, Rgba5551ToRgba8888(gs->m_clut[clutIndex & 0x1FFu]));
+        return applyTexa(submission.texa, cpsm, Rgba5551ToRgba8888(submission.clut[clutIndex & 0x1FFu]));
     default:
         break;
     }
@@ -741,9 +784,11 @@ uint32_t GSRasterizer::lookupCLUT(GS *gs,
     return 0xFFFF00FFu;
 }
 
-uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t u, uint16_t v, int linearFilterOverride)
+uint32_t GSRasterizer::sampleTexture(GS *gs, const GSPrimitiveSubmission &submission,
+                                     float s, float t, float q, uint16_t u, uint16_t v,
+                                     int linearFilterOverride)
 {
-    const auto &ctx = gs->activeContext();
+    const auto &ctx = submission.context;
     const auto &tex = ctx.tex0;
 
     const int texW = textureDimension(tex.tw);
@@ -755,19 +800,6 @@ uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t
     const uint16_t maxU = static_cast<uint16_t>((clamp >> 14) & 0x3FFu);
     const uint16_t minV = static_cast<uint16_t>((clamp >> 24) & 0x3FFu);
     const uint16_t maxV = static_cast<uint16_t>((clamp >> 34) & 0x3FFu);
-
-    float texUf, texVf;
-    if (gs->m_prim.fst)
-    {
-        texUf = static_cast<float>(u) / 16.0f;
-        texVf = static_cast<float>(v) / 16.0f;
-    }
-    else
-    {
-        const float invQ = 1.0f / fabsQ(q);
-        texUf = s * invQ * static_cast<float>(texW);
-        texVf = t * invQ * static_cast<float>(texH);
-    }
 
     auto samplePoint = [&](int sampleU, int sampleV) -> uint32_t
     {
@@ -782,18 +814,18 @@ uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t
         case GS_PSM_Z32:
         case GS_PSM_CT24:
         case GS_PSM_Z24:
-            return applyTexa(gs->m_texa, tex.psm, out);
+            return applyTexa(submission.texa, tex.psm, out);
         case GS_PSM_CT16:
         case GS_PSM_CT16S:
         case GS_PSM_Z16:
         case GS_PSM_Z16S:
-            return applyTexa(gs->m_texa, tex.psm, Rgba5551ToRgba8888(out));
+            return applyTexa(submission.texa, tex.psm, Rgba5551ToRgba8888(out));
         case GS_PSM_T8:
         case GS_PSM_T8H:
         case GS_PSM_T4:
         case GS_PSM_T4HL:
         case GS_PSM_T4HH:
-            return lookupCLUT(gs, static_cast<u8>(out), tex.cbp, tex.cpsm, tex.csm, tex.csa, tex.psm);
+            return lookupCLUT(gs, submission, static_cast<u8>(out), tex.cbp, tex.cpsm, tex.csm, tex.csa, tex.psm);
         }
 
         return 0xFFFF00FFu;
@@ -802,6 +834,25 @@ uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t
     const bool linearFilter = linearFilterOverride >= 0
                                   ? linearFilterOverride != 0
                                   : tex1UsesLinearFilter(ctx.tex1);
+    // FST UVs are already unsigned 12.4 coordinates. Point filtering only
+    // needs the integer texel; avoid converting to float and flooring twice
+    // for the common nearest-neighbor path.
+    if (submission.prim.fst && !linearFilter)
+        return samplePoint(static_cast<int>(u >> 4u), static_cast<int>(v >> 4u));
+
+    float texUf, texVf;
+    if (submission.prim.fst)
+    {
+        texUf = static_cast<float>(u) / 16.0f;
+        texVf = static_cast<float>(v) / 16.0f;
+    }
+    else
+    {
+        const float invQ = 1.0f / fabsQ(q);
+        texUf = s * invQ * static_cast<float>(texW);
+        texVf = t * invQ * static_cast<float>(texH);
+    }
+
     const int fixedU = static_cast<int>(std::floor(texUf * 16.0f));
     const int fixedV = static_cast<int>(std::floor(texVf * 16.0f));
 
@@ -853,11 +904,12 @@ uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t
            (static_cast<uint32_t>(a) << 24);
 }
 
-void GSRasterizer::drawSprite(GS *gs)
+void GSRasterizer::drawSprite(GS *gs, const GSPrimitiveSubmission &submission,
+                              GSPrimitiveEffects &effects)
 {
-    const GSVertex &v0 = gs->m_vtxQueue[0];
-    const GSVertex &v1 = gs->m_vtxQueue[1];
-    const auto &ctx = gs->activeContext();
+    const GSVertex &v0 = submission.vertices[0];
+    const GSVertex &v1 = submission.vertices[1];
+    const auto &ctx = submission.context;
 
     const float ofx = static_cast<float>(ctx.xyoffset.ofx) / 16.0f;
     const float ofy = static_cast<float>(ctx.xyoffset.ofy) / 16.0f;
@@ -901,10 +953,10 @@ void GSRasterizer::drawSprite(GS *gs)
     const uint8_t alphaMode = static_cast<uint8_t>(alphaReg & 0xFFu);
     const uint8_t alphaFix = static_cast<uint8_t>((alphaReg >> 32) & 0xFFu);
     const bool looksLikeDisplayCopy =
-        gs->m_prim.tme &&
-        gs->m_prim.abe &&
-        gs->m_prim.fst &&
-        gs->m_prim.ctxt &&
+        submission.prim.tme &&
+        submission.prim.abe &&
+        submission.prim.fst &&
+        submission.prim.ctxt &&
         ctx.frame.fbp != ctx.tex0.tbp0 &&
         alphaMode == 0x64u &&
         (alphaFix == 0x60u || alphaFix == 0x80u) &&
@@ -914,21 +966,21 @@ void GSRasterizer::drawSprite(GS *gs)
         unclippedY1 >= 447;
     if (looksLikeDisplayCopy)
     {
-        gs->m_preferredDisplaySourceFrame = {ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm, 0u};
-        gs->m_preferredDisplayDestFbp = ctx.frame.fbp;
-        gs->m_hasPreferredDisplaySource = true;
+        effects.setPreferredDisplaySource = true;
+        effects.preferredDisplaySourceFrame = {ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm, 0u};
+        effects.preferredDisplayDestFbp = ctx.frame.fbp;
     }
 
     uint8_t r = v1.r, g = v1.g, b = v1.b, a = v1.a;
 
-    if (gs->m_prim.tme)
+    if (submission.prim.tme)
     {
         const auto &tex = ctx.tex0;
         const int texW = textureDimension(tex.tw);
         const int texH = textureDimension(tex.th);
 
         float u0f, v0f, u1f, v1f;
-        if (gs->m_prim.fst)
+        if (submission.prim.fst)
         {
             u0f = static_cast<float>(v0.u) / 16.0f;
             v0f = static_cast<float>(v0.v) / 16.0f;
@@ -960,17 +1012,17 @@ void GSRasterizer::drawSprite(GS *gs)
                 const float tx = (static_cast<float>(x) - screenX0) / screenSpanX;
                 float texUf = u0f + (u1f - u0f) * tx;
                 uint32_t texel = 0xFFFF00FFu;
-                if (gs->m_prim.fst)
+                if (submission.prim.fst)
                 {
                     const int fixedU = static_cast<int>((texUf * 16.0f) + 0.5f);
                     const int fixedV = static_cast<int>((texVf * 16.0f) + 0.5f);
                     const uint16_t sampleU = static_cast<uint16_t>(clampInt(fixedU, 0, 0xFFFF));
                     const uint16_t sampleV = static_cast<uint16_t>(clampInt(fixedV, 0, 0xFFFF));
-                    texel = sampleTexture(gs, 0.0f, 0.0f, 1.0f, sampleU, sampleV, spriteLinearFilter);
+                    texel = sampleTexture(gs, submission, 0.0f, 0.0f, 1.0f, sampleU, sampleV, spriteLinearFilter);
                 }
                 else
                 {
-                    texel = sampleTexture(gs, texUf / static_cast<float>(texW), texVf / static_cast<float>(texH), 1.0f, 0u, 0u, spriteLinearFilter);
+                    texel = sampleTexture(gs, submission, texUf / static_cast<float>(texW), texVf / static_cast<float>(texH), 1.0f, 0u, 0u, spriteLinearFilter);
                 }
 
                 uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
@@ -979,7 +1031,7 @@ void GSRasterizer::drawSprite(GS *gs)
                 uint8_t ta = static_cast<uint8_t>((texel >> 24) & 0xFF);
 
                 const TextureCombineResult color = combineTexture(tex, r, g, b, a, tr, tg, tb, ta);
-                writePixel(gs, x, y, z1, color.r, color.g, color.b, color.a, v1.fog);
+                writePixel(gs, submission, x, y, z1, color.r, color.g, color.b, color.a, v1.fog);
             }
         }
     }
@@ -987,16 +1039,16 @@ void GSRasterizer::drawSprite(GS *gs)
     {
         for (int y = drawY0; y <= drawY1; ++y)
             for (int x = drawX0; x <= drawX1; ++x)
-                writePixel(gs, x, y, z1, r, g, b, a, v1.fog);
+                writePixel(gs, submission, x, y, z1, r, g, b, a, v1.fog);
     }
 }
 
-void GSRasterizer::drawTriangle(GS *gs)
+void GSRasterizer::drawTriangle(GS *gs, const GSPrimitiveSubmission &submission)
 {
-    const GSVertex &v0 = gs->m_vtxQueue[0];
-    const GSVertex &v1 = gs->m_vtxQueue[1];
-    const GSVertex &v2 = gs->m_vtxQueue[2];
-    const auto &ctx = gs->activeContext();
+    const GSVertex &v0 = submission.vertices[0];
+    const GSVertex &v1 = submission.vertices[1];
+    const GSVertex &v2 = submission.vertices[2];
+    const auto &ctx = submission.context;
 
     const float ofx = static_cast<float>(ctx.xyoffset.ofx) / 16.0f;
     const float ofy = static_cast<float>(ctx.xyoffset.ofy) / 16.0f;
@@ -1046,7 +1098,7 @@ void GSRasterizer::drawTriangle(GS *gs)
         isTopLeft(fx[2], fy[2], fx[0], fy[0]),
         isTopLeft(fx[0], fy[0], fx[1], fy[1])};
     const double invArea = 1.0 / area;
-    const bool halfPixelHalfTexelFst = gs->m_prim.fst &&
+    const bool halfPixelHalfTexelFst = submission.prim.fst &&
         std::all_of(fx.begin(), fx.end(), [](float value)
         {
             return std::fabs(std::fmod(value, 1.0f)) == 0.5f;
@@ -1059,6 +1111,29 @@ void GSRasterizer::drawTriangle(GS *gs)
         {
             return (value->u & 0xFu) == 8u && (value->v & 0xFu) == 8u;
         });
+
+    // Resolve the common nearest FST texture state once for the triangle.
+    // The reference sampler remains available for every other GS state.
+    const auto &texture = ctx.tex0;
+    const bool fastFstPoint = m_fastFstPointSamplingEnabled &&
+        submission.prim.tme && submission.prim.fst &&
+        !tex1UsesLinearFilter(ctx.tex1) &&
+        (texture.psm == GS_PSM_CT32 || texture.psm == GS_PSM_T8);
+    const int fastTexW = fastFstPoint ? textureDimension(texture.tw) : 0;
+    const int fastTexH = fastFstPoint ? textureDimension(texture.th) : 0;
+    const uint64_t clamp = ctx.clamp;
+    const uint8_t fastWrapU = static_cast<uint8_t>(clamp & 3u);
+    const uint8_t fastWrapV = static_cast<uint8_t>((clamp >> 2u) & 3u);
+    const uint16_t fastMinU = static_cast<uint16_t>((clamp >> 4u) & 0x3FFu);
+    const uint16_t fastMaxU = static_cast<uint16_t>((clamp >> 14u) & 0x3FFu);
+    const uint16_t fastMinV = static_cast<uint16_t>((clamp >> 24u) & 0x3FFu);
+    const uint16_t fastMaxV = static_cast<uint16_t>((clamp >> 34u) & 0x3FFu);
+    if (m_samplerStatsEnabled && submission.prim.tme)
+    {
+        ++m_samplerStats.texturedTriangles;
+        if (fastFstPoint)
+            ++m_samplerStats.eligibleTriangles;
+    }
 
     for (int y = minY; y <= maxY; ++y)
     {
@@ -1094,7 +1169,7 @@ void GSRasterizer::drawTriangle(GS *gs)
             const double z = i0.z * w0 + i1.z * w1 + i2.z * w2;
 
             uint8_t r, g, b, a;
-            if (gs->m_prim.iip)
+            if (submission.prim.iip)
             {
                 r = clampU8(static_cast<int>(i0.r * w0 + i1.r * w1 + i2.r * w2));
                 g = clampU8(static_cast<int>(i0.g * w0 + i1.g * w1 + i2.g * w2));
@@ -1109,11 +1184,13 @@ void GSRasterizer::drawTriangle(GS *gs)
                 a = v2.a;
             }
 
-            if (gs->m_prim.tme)
+            if (submission.prim.tme)
             {
+                if (m_samplerStatsEnabled)
+                    ++m_samplerStats.texturedSamples;
                 float is, it, iq;
                 uint16_t iu, iv;
-                if (gs->m_prim.fst)
+                if (submission.prim.fst)
                 {
                     const double interpolatedU = i0.u * w0 + i1.u * w1 + i2.u * w2;
                     const double interpolatedV = i0.v * w0 + i1.v * w1 + i2.v * w2;
@@ -1150,7 +1227,26 @@ void GSRasterizer::drawTriangle(GS *gs)
                     iv = 0;
                 }
 
-                uint32_t texel = sampleTexture(gs, is, it, iq, iu, iv);
+                uint32_t texel = 0u;
+                if (fastFstPoint)
+                {
+                    const uint32_t sampleU = static_cast<uint32_t>(wrapTextureCoordinate(
+                        static_cast<int>(iu >> 4u), fastTexW, fastWrapU, fastMinU, fastMaxU));
+                    const uint32_t sampleV = static_cast<uint32_t>(wrapTextureCoordinate(
+                        static_cast<int>(iv >> 4u), fastTexH, fastWrapV, fastMinV, fastMaxV));
+                    const uint32_t raw = gs->ReadVram(texture.psm, texture.tbp0, texture.tbw,
+                                                      sampleU, sampleV);
+                    texel = texture.psm == GS_PSM_CT32
+                        ? raw
+                        : lookupCLUT(gs, submission, static_cast<uint8_t>(raw), texture.cbp,
+                                     texture.cpsm, texture.csm, texture.csa, texture.psm);
+                    if (m_samplerStatsEnabled)
+                        ++m_samplerStats.fastSamples;
+                }
+                else
+                {
+                    texel = sampleTexture(gs, submission, is, it, iq, iu, iv);
+                }
 
                 uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
                 uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
@@ -1171,16 +1267,16 @@ void GSRasterizer::drawTriangle(GS *gs)
             }
 
             const uint8_t fog = clampU8(static_cast<int>(i0.fog * w0 + i1.fog * w1 + i2.fog * w2));
-            writePixel(gs, x, y, static_cast<u32>(z + 0.5), r, g, b, a, fog);
+            writePixel(gs, submission, x, y, static_cast<u32>(z + 0.5), r, g, b, a, fog);
         }
     }
 }
 
-void GSRasterizer::drawLine(GS *gs)
+void GSRasterizer::drawLine(GS *gs, const GSPrimitiveSubmission &submission)
 {
-    const GSVertex &v0 = gs->m_vtxQueue[0];
-    const GSVertex &v1 = gs->m_vtxQueue[1];
-    const auto &ctx = gs->activeContext();
+    const GSVertex &v0 = submission.vertices[0];
+    const GSVertex &v1 = submission.vertices[1];
+    const auto &ctx = submission.context;
 
     int ofx = ctx.xyoffset.ofx >> 4;
     int ofy = ctx.xyoffset.ofy >> 4;
@@ -1205,7 +1301,7 @@ void GSRasterizer::drawLine(GS *gs)
     {
         float t = static_cast<float>(step) / static_cast<float>(totalSteps);
         uint8_t r, g, b, a;
-        if (gs->m_prim.iip)
+        if (submission.prim.iip)
         {
             r = clampU8(static_cast<int>(v0.r + (v1.r - v0.r) * t));
             g = clampU8(static_cast<int>(v0.g + (v1.g - v0.g) * t));
@@ -1222,7 +1318,7 @@ void GSRasterizer::drawLine(GS *gs)
 
         double z = (v0.z + (v1.z - v0.z) * t);
         const uint8_t fog = clampU8(static_cast<int>(v0.fog + (v1.fog - v0.fog) * t));
-        writePixel(gs, x0, y0, static_cast<u32>(z), r, g, b, a, fog);
+        writePixel(gs, submission, x0, y0, static_cast<u32>(z), r, g, b, a, fog);
 
         if (x0 == x1 && y0 == y1)
             break;

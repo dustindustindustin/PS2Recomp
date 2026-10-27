@@ -2,7 +2,13 @@
 #define PS2_VU1_H
 
 #include <array>
+#include <atomic>
+#include <bit>
 #include <cstdint>
+
+#ifndef PS2X_VU_INLINE_NORMALIZE_OPERAND
+#define PS2X_VU_INLINE_NORMALIZE_OPERAND 0
+#endif
 
 class GS;
 class PS2Memory;
@@ -69,8 +75,8 @@ public:
 
     VU1State &state() { return m_state; }
     const VU1State &state() const { return m_state; }
-    uint64_t runCount() const { return m_runCount; }
-    uint64_t instructionPairCount() const { return m_instructionPairCount; }
+    uint64_t runCount() const { return m_runCount.load(std::memory_order_relaxed); }
+    uint64_t instructionPairCount() const { return m_instructionPairCount.load(std::memory_order_relaxed); }
     uint64_t xgkickCount() const { return m_xgkickCount; }
     StopReason lastStopReason() const { return m_lastStopReason; }
     uint32_t lastExecutedPc() const { return m_lastExecutedPc; }
@@ -227,8 +233,8 @@ private:
     uint32_t m_cachedCodeSize = 0;
     uint64_t m_cachedCodeGeneration = 0;
     bool m_decodedCodeCacheValid = false;
-    uint64_t m_runCount = 0;
-    uint64_t m_instructionPairCount = 0;
+    std::atomic<uint64_t> m_runCount{0};
+    std::atomic<uint64_t> m_instructionPairCount{0};
     uint64_t m_xgkickCount = 0;
     StopReason m_lastStopReason = StopReason::None;
     uint32_t m_lastExecutedPc = 0;
@@ -246,6 +252,12 @@ private:
     std::array<PendingVfWrite, kMaxPendingVfWrites> m_vfWritePipeline{};
     std::array<PendingViWrite, kMaxPendingViWrites> m_viWritePipeline{};
     std::array<PendingAccWrite, kMaxPendingAccWrites> m_accWritePipeline{};
+    uint8_t m_pendingFlagWrites = 0;
+    uint8_t m_pendingEfuWrites = 0;
+    uint8_t m_pendingStores = 0;
+    uint8_t m_pendingVfWrites = 0;
+    uint8_t m_pendingViWrites = 0;
+    uint8_t m_pendingAccWrites = 0;
     XgkickPipeline m_xgkick{};
     std::array<std::array<uint64_t, 4>, 32> m_vfReady{};
     std::array<uint64_t, 16> m_viReady{};
@@ -319,13 +331,27 @@ private:
     void markPairWrites(const DecodedInstructionPair &decoded);
     bool pipelinesPending() const;
 
+    // Called for every FMAC source lane. Keep the ordinary finite case in the
+    // instruction's translation unit so it does not pay an out-of-line call.
+#if PS2X_VU_INLINE_NORMALIZE_OPERAND
+    float normalizeOperand(float value) const
+    {
+        const uint32_t bits = std::bit_cast<uint32_t>(value);
+        const uint32_t exponent = bits & 0x7F800000u;
+        if (exponent != 0u && exponent != 0x7F800000u)
+            return value;
+        const uint32_t normalized = (bits & 0x80000000u) |
+                                    (exponent == 0u ? 0u : 0x7F7FFFFFu);
+        return std::bit_cast<float>(normalized);
+    }
+#else
     float normalizeOperand(float value) const;
+#endif
     float normalizeResult(float value, uint32_t &laneFlags) const;
     uint32_t microAddressMask() const;
     int32_t readBranchVi(uint8_t reg) const;
     void recordViWriteForBranch(uint8_t reg, int32_t oldValue);
     void reportReservedInstruction(bool upper, uint32_t instruction);
-    float broadcast(const float *vf, uint8_t bc);
 };
 
 #endif

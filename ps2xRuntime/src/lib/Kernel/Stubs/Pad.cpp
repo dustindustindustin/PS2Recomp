@@ -281,7 +281,8 @@ namespace ps2_stubs
             bool backendActive = false;
             uint8_t backendData[32]{};
             if (!overrideActive && runtime &&
-                runtime->padBackend().readState(port, slot, backendData, sizeof(backendData)))
+                runtime->padBackend().readState(port, slot, backendData, sizeof(backendData),
+                                               runtime->gs().hostPresentationGeneration()))
             {
                 state.buttons = static_cast<uint16_t>(backendData[2] | (backendData[3] << 8));
                 state.rx = backendData[4];

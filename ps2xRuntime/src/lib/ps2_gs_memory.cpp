@@ -220,6 +220,43 @@ namespace GSMem
         PixelStorageTraits<P4>::InitPageLookupTable(PageTableP4, BlockTableP4, ColumnTable4);
     }
 
+    template<PixelStorageMode psm>
+    static bool GetPixelByteRangeImpl(const typename PixelStorageTraits<psm>::PageLookupTableT &table,
+                                      u32 bp, u32 bw, u32 x, u32 y,
+                                      PixelByteRange &outRange)
+    {
+        using Traits = PixelStorageTraits<psm>;
+        const u32 pixelAddr = Traits::Address(table, bp, bw, x, y);
+        const u32 bits = pixelAddr * UnpackedBitWidth(psm) + Traits::BitOffset();
+        const u32 byteAddr = (bits / 8u) & (MEMORY_SIZE - sizeof(typename Traits::PackedT));
+        outRange.offset = byteAddr;
+        outRange.sizeBytes = static_cast<u32>(sizeof(typename Traits::PackedT));
+        outRange.readModifyWrite = psm == C24 || psm == Z24 || psm == P4 ||
+                                   psm == P4HL || psm == P4HH;
+        return true;
+    }
+
+    bool GetPixelByteRange(u32 rawPsm, u32 bp, u32 bw, u32 x, u32 y, PixelByteRange &outRange)
+    {
+        switch (static_cast<PixelStorageMode>(rawPsm))
+        {
+        case C32: return GetPixelByteRangeImpl<C32>(PageTableC32, bp, bw, x, y, outRange);
+        case C24: return GetPixelByteRangeImpl<C24>(PageTableC32, bp, bw, x, y, outRange);
+        case C16: return GetPixelByteRangeImpl<C16>(PageTableC16, bp, bw, x, y, outRange);
+        case C16S: return GetPixelByteRangeImpl<C16S>(PageTableC16S, bp, bw, x, y, outRange);
+        case P8: return GetPixelByteRangeImpl<P8>(PageTableP8, bp, bw, x, y, outRange);
+        case P4: return GetPixelByteRangeImpl<P4>(PageTableP4, bp, bw, x, y, outRange);
+        case P8H: return GetPixelByteRangeImpl<P8H>(PageTableC32, bp, bw, x, y, outRange);
+        case P4HL: return GetPixelByteRangeImpl<P4HL>(PageTableC32, bp, bw, x, y, outRange);
+        case P4HH: return GetPixelByteRangeImpl<P4HH>(PageTableC32, bp, bw, x, y, outRange);
+        case Z32: return GetPixelByteRangeImpl<Z32>(PageTableZ32, bp, bw, x, y, outRange);
+        case Z24: return GetPixelByteRangeImpl<Z24>(PageTableZ32, bp, bw, x, y, outRange);
+        case Z16: return GetPixelByteRangeImpl<Z16>(PageTableZ16, bp, bw, x, y, outRange);
+        case Z16S: return GetPixelByteRangeImpl<Z16S>(PageTableZ16S, bp, bw, x, y, outRange);
+        default: return false;
+        }
+    }
+
     void WriteCT32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value)
     {
         PixelStorageTraits<C32>::Write(PageTableC32, data, bp, bw, x, y, value);

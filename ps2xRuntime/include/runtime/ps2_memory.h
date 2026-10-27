@@ -328,6 +328,7 @@ public:
     using GifPacketCallback = std::function<void(const uint8_t *, uint32_t)>;
     void setGifPacketCallback(GifPacketCallback cb) { m_gifPacketCallback = std::move(cb); }
     void setGifArbiter(GifArbiter *arbiter) { m_gifArbiter = arbiter; }
+    bool gifAsyncEnabled() const { return m_gifArbiter && m_gifArbiter->asyncEnabled(); }
 
     using Vu1MscalCallback = std::function<void(uint32_t startPC, uint32_t top, uint32_t itop)>;
     void setVu1MscalCallback(Vu1MscalCallback cb) { m_vu1MscalCallback = std::move(cb); }
@@ -369,8 +370,8 @@ public:
     // GS register accessors
     GSRegisters &gs() { return gs_regs; }
     const GSRegisters &gs() const { return gs_regs; }
-    uint8_t *getGSVRAM() { return m_gsVRAM; }
-    const uint8_t *getGSVRAM() const { return m_gsVRAM; }
+    bool bindGS(GS &gs);
+    uint64_t gsVramGeneration() const { return m_gsVramGeneration; }
     bool hasSeenGifCopy() const { return m_seenGifCopy; }
     // Main RAM (32MB)
     uint8_t *m_rdram;
@@ -398,7 +399,12 @@ public:
 
     // Registers
     GSRegisters gs_regs;
+
+private:
     uint8_t *m_gsVRAM;
+    uint64_t m_gsVramGeneration = 0u;
+
+public:
     VIFRegisters vif0_regs;
     VIFRegisters vif1_regs;
     DMARegisters dma_regs[10]; // 10 DMA channels

@@ -333,6 +333,7 @@ namespace ps2_syscalls
         }
 
         constexpr uint64_t kGsCsrFieldMask = 0x2000ull;
+        (void)runtime->gs(); // Complete GIF writes before updating the shared CSR state.
         std::atomic<uint64_t> &csr = runtime->memory().gs().csr;
         if (tickValue & 1ull)
         {

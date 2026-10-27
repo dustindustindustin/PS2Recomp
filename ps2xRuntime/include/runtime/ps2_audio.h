@@ -11,6 +11,7 @@ class PS2AudioBackend
 {
 public:
     PS2AudioBackend();
+    // Destroy on the audio owner while its device is still alive.
     ~PS2AudioBackend();
 
     void onVagTransfer(const uint8_t *rdram, uint32_t srcAddr, uint32_t sizeBytes);
@@ -23,7 +24,12 @@ public:
               uint32_t voiceIndex = 0xFFFFFFFFu);
     void stop(uint32_t voiceId);
     void stopAll();
-    void setAudioReady(bool ready) { m_audioReady = ready; }
+    void setAudioReady(bool ready);
+    // Commands only mirror state. Device calls run in pump() on the host owner.
+    void onDuelistsAutoDma(const uint8_t *rdram, uint32_t function,
+                          const uint8_t *send, uint32_t sendSize,
+                          uint8_t *receive, uint32_t receiveSize);
+    void pump();
 
 private:
     struct DecodedSample

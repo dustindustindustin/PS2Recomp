@@ -837,6 +837,79 @@ void register_ps2_memory_tests()
             t.Equals(order[2], static_cast<uint8_t>(0x33u), "PATH3 should be drained third");
         });
 
+        tc.Run("GIF async worker preserves ordering, copies packets, and fences completion", [](TestCase &t)
+        {
+            std::vector<uint8_t> order;
+            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
+            {
+                if (data && sizeBytes == 16u)
+                {
+                    order.push_back(data[0]);
+                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                }
+            });
+            arbiter.setAsyncEnabled(true);
+
+            std::vector<uint8_t> path3(16u, 0u);
+            path3[0] = 0xE3u;
+            std::vector<uint8_t> path2(16u, 0u);
+            path2[0] = 0xE2u;
+            std::vector<uint8_t> path1(16u, 0u);
+            path1[0] = 0xE1u;
+            arbiter.submit(GifPathId::Path3, path3.data(), static_cast<uint32_t>(path3.size()));
+            arbiter.submit(GifPathId::Path2, path2.data(), static_cast<uint32_t>(path2.size()));
+            arbiter.submit(GifPathId::Path1, path1.data(), static_cast<uint32_t>(path1.size()));
+            path3[0] = 0u;
+            path2[0] = 0u;
+            path1[0] = 0u;
+            arbiter.flushAsync();
+            arbiter.drain();
+
+            t.Equals(order.size(), static_cast<size_t>(3u), "drain should wait for each dispatched packet");
+            t.Equals(order[0], static_cast<uint8_t>(0xE1u), "PATH1 should remain first in the asynchronous batch");
+            t.Equals(order[1], static_cast<uint8_t>(0xE2u), "PATH2 should remain second in the asynchronous batch");
+            t.Equals(order[2], static_cast<uint8_t>(0xE3u), "PATH3 should remain last in the asynchronous batch");
+            t.IsTrue(arbiter.empty(), "completion fence should leave no staged or active packets");
+
+            arbiter.setAsyncEnabled(false);
+            std::vector<uint8_t> synchronous(16u, 0x5Au);
+            arbiter.submit(GifPathId::Path1, synchronous.data(), static_cast<uint32_t>(synchronous.size()));
+            arbiter.drain();
+            t.Equals(order.back(), static_cast<uint8_t>(0x5Au), "worker shutdown should restore synchronous processing");
+        });
+
+        tc.Run("GIF async queue applies bounded backpressure and joins on shutdown", [](TestCase &t)
+        {
+            std::vector<uint8_t> order;
+            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
+            {
+                if (data && sizeBytes == 16u)
+                {
+                    order.push_back(data[0]);
+                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                }
+            });
+            arbiter.setAsyncEnabled(true);
+
+            for (uint32_t index = 0u; index < 257u; ++index)
+            {
+                std::vector<uint8_t> packet(16u, 0u);
+                packet[0] = static_cast<uint8_t>(index & 0xFFu);
+                arbiter.submit(GifPathId::Path1, packet.data(), static_cast<uint32_t>(packet.size()));
+                packet[0] = 0xFFu;
+            }
+            arbiter.flushAsync();
+            arbiter.drain();
+
+            t.Equals(order.size(), static_cast<size_t>(257u), "bounded queue should process every submitted packet");
+            t.IsTrue(arbiter.backpressureCount() > 0u, "packet-capacity limit should apply backpressure");
+            t.IsTrue(arbiter.highWaterBytes() <= 8u * 1024u * 1024u, "async queue must stay within its byte bound");
+            for (uint32_t index = 0u; index < 257u; ++index)
+            {
+                t.Equals(order[index], static_cast<uint8_t>(index & 0xFFu), "queue must own an ordered packet copy");
+            }
+        });
+
         tc.Run("VIF DIRECTHL stalls behind queued PATH3 IMAGE packets", [](TestCase &t)
         {
             PS2Memory mem;
@@ -1007,7 +1080,7 @@ void register_ps2_memory_tests()
             t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
 
             GS gs;
-            gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
+            mem.bindGS(gs);
 
             constexpr uint32_t kGifCh = 0x1000A000u;
             constexpr uint32_t kDStat = 0x1000E010u;
@@ -1047,7 +1120,9 @@ void register_ps2_memory_tests()
                 const uint32_t srcOff = kPixels + x * 4u;
                 for (uint32_t c = 0; c < 4u; ++c)
                 {
-                    if (mem.getGSVRAM()[dstOff + c] != rdram[srcOff + c])
+                    uint8_t actualByte = 0u;
+                    gs.copyVramBytes(dstOff + c, &actualByte, sizeof(actualByte));
+                    if (actualByte != rdram[srcOff + c])
                     {
                         pixelsOk = false;
                         break;
@@ -1063,7 +1138,7 @@ void register_ps2_memory_tests()
             t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
 
             GS nativeGs;
-            nativeGs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
+            mem.bindGS(nativeGs);
 
             GSRegisters genericRegs{};
             std::vector<uint8_t> genericVram(PS2_GS_VRAM_SIZE, 0u);
@@ -1115,8 +1190,8 @@ void register_ps2_memory_tests()
             t.Equals(mem.readIORegister(kGifCh + 0x00u) & 0x100u, 0u,
                      "native packed GIF chain should clear GIF STR");
 
-            const uint32_t nativePixel = nativeGs.ReadVram(GS_PSM_CT32, 0u, 1u, 1u, 1u);
-            const uint32_t genericPixel = genericGs.ReadVram(GS_PSM_CT32, 0u, 1u, 1u, 1u);
+            const uint32_t nativePixel = nativeGs.readVramPixel(GS_PSM_CT32, 0u, 1u, 1u, 1u);
+            const uint32_t genericPixel = genericGs.readVramPixel(GS_PSM_CT32, 0u, 1u, 1u, 1u);
             t.IsTrue(genericPixel != 0u, "generic packed primitive packet should draw a test pixel");
             t.Equals(nativePixel, genericPixel, "native packed GIF chain should match generic GS packet output");
         });
@@ -1127,7 +1202,7 @@ void register_ps2_memory_tests()
             t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
 
             GS gs;
-            gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
+            mem.bindGS(gs);
             std::vector<uint8_t> capturedGifPacket;
             mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
             {
@@ -1203,7 +1278,7 @@ void register_ps2_memory_tests()
             const uint32_t row1Off = GSPSMCT32::addrPSMCT32(kCt32Dbp, 1u, 0u, 1u);
             uint32_t actualRow1X0 = 0u;
             uint32_t expectedRow1X0 = 0u;
-            std::memcpy(&actualRow1X0, mem.getGSVRAM() + row1Off, sizeof(actualRow1X0));
+            gs.copyVramBytes(row1Off, &actualRow1X0, sizeof(actualRow1X0));
             std::memcpy(&expectedRow1X0, rdram + kCt32Data + kWidth * 4u, sizeof(expectedRow1X0));
             t.Equals(actualRow1X0, expectedRow1X0, "CT32 row 1 must come from CT32 data, not the previous T4 REF payload");
 
@@ -1216,7 +1291,9 @@ void register_ps2_memory_tests()
                     const uint32_t srcOff = kCt32Data + ((y * kWidth + x) * 4u);
                     for (uint32_t c = 0; c < 4u; ++c)
                     {
-                        if (mem.getGSVRAM()[dstOff + c] != rdram[srcOff + c])
+                        uint8_t actualByte = 0u;
+                        gs.copyVramBytes(dstOff + c, &actualByte, sizeof(actualByte));
+                        if (actualByte != rdram[srcOff + c])
                         {
                             ct32Ok = false;
                             break;
@@ -1790,7 +1867,7 @@ void register_ps2_memory_tests()
             t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
 
             GS gs;
-            gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
+            mem.bindGS(gs);
             GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
             {
                 gs.processGIFPacket(data, sizeBytes);
@@ -1835,14 +1912,15 @@ void register_ps2_memory_tests()
 
             mem.processPendingTransfers();
 
-            const uint8_t *vramOut = mem.getGSVRAM();
             bool imageOk = true;
             for (uint32_t x = 0; x < 4u && imageOk; ++x)
             {
                 const uint32_t off = GSPSMCT32::addrPSMCT32(0u, 1u, x, 0u);
                 for (uint32_t c = 0; c < 4u; ++c)
                 {
-                    if (vramOut[off + c] != static_cast<uint8_t>(0x70u + x * 4u + c))
+                    uint8_t actualByte = 0u;
+                    gs.copyVramBytes(off + c, &actualByte, sizeof(actualByte));
+                    if (actualByte != static_cast<uint8_t>(0x70u + x * 4u + c))
                     {
                         imageOk = false;
                         break;
@@ -1858,7 +1936,7 @@ void register_ps2_memory_tests()
             t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
 
             GS gs;
-            gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
+            mem.bindGS(gs);
             GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
             {
                 gs.processGIFPacket(data, sizeBytes);
@@ -1888,14 +1966,15 @@ void register_ps2_memory_tests()
 
             mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
 
-            const uint8_t *vramOut = mem.getGSVRAM();
             bool imageOk = true;
             for (uint32_t x = 0; x < 4u && imageOk; ++x)
             {
                 const uint32_t off = GSPSMCT32::addrPSMCT32(0u, 1u, x, 0u);
                 for (uint32_t c = 0; c < 4u; ++c)
                 {
-                    if (vramOut[off + c] != static_cast<uint8_t>(0xA0u + x * 4u + c))
+                    uint8_t actualByte = 0u;
+                    gs.copyVramBytes(off + c, &actualByte, sizeof(actualByte));
+                    if (actualByte != static_cast<uint8_t>(0xA0u + x * 4u + c))
                     {
                         imageOk = false;
                         break;

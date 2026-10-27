@@ -1527,6 +1527,7 @@ namespace
 
     void drawGsTab(PS2Runtime &runtime)
     {
+        (void)runtime.gs();
         GSRegisters &regs = runtime.memory().gs();
         const GSDebugSnapshot gs = runtime.gs().getDebugSnapshot();
 

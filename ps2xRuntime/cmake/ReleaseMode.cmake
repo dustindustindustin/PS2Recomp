@@ -1,5 +1,7 @@
 include(CheckIPOSupported)
 
+option(PS2X_ENABLE_HOST_AVX2 "Require AVX2 on the target CPU (not for portable binaries)" OFF)
+
 check_ipo_supported(RESULT IPO_SUPPORTED OUTPUT IPO_ERROR)
 
 function(EnableFastReleaseMode TargetName)
@@ -15,13 +17,15 @@ function(EnableFastReleaseMode TargetName)
                 /Gw # global data in COMDAT
                 /GF # string pooling
                 /Zc:inline # remove unreferenced inline
-                /fp:fast # fast math (graphics friendly)
+                /fp:precise # Preserve emulated floating-point behavior.
                 /DNDEBUG
-                /arch:AVX2 # Advanced Vector Extensions 2
                 /GS- # Disable Buffer Security Check (faster)
                 /Qspectre- # Disable Spectre mitigations (faster)
             >
         )
+        if(PS2X_ENABLE_HOST_AVX2)
+            target_compile_options(${TargetName} PRIVATE $<$<CONFIG:Release>:/arch:AVX2>)
+        endif()
 
         if(TARGET ${TargetName})
             target_link_options(${TargetName} PRIVATE

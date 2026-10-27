@@ -288,6 +288,7 @@ bool PS2Memory::initialize(size_t ramSize)
     };
 
     cleanup();
+    ++m_gsVramGeneration;
     m_seenGifCopy = false;
     m_dmaStartCount.store(0, std::memory_order_relaxed);
     m_gifCopyCount.store(0, std::memory_order_relaxed);
@@ -374,6 +375,14 @@ bool PS2Memory::initialize(size_t ramSize)
         cleanup();
         return false;
     }
+}
+
+bool PS2Memory::bindGS(GS &gs)
+{
+    if (!m_gsVRAM)
+        return false;
+    gs.init(m_gsVRAM, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &gs_regs);
+    return true;
 }
 
 void PS2Memory::updateEeTimer0Counter()
@@ -631,6 +640,8 @@ uint32_t PS2Memory::read32(uint32_t address)
 
     if (isGsPrivReg(address))
     {
+        if (m_gifArbiter && m_gifArbiter->asyncEnabled())
+            m_gifArbiter->drain();
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
@@ -679,6 +690,8 @@ uint64_t PS2Memory::read64(uint32_t address)
 
     if (isGsPrivReg(address))
     {
+        if (m_gifArbiter && m_gifArbiter->asyncEnabled())
+            m_gifArbiter->drain();
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
@@ -840,6 +853,8 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
 
     if (isGsPrivReg(address))
     {
+        if (m_gifArbiter && m_gifArbiter->asyncEnabled())
+            m_gifArbiter->drain();
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
@@ -900,6 +915,8 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
 
     if (isGsPrivReg(address))
     {
+        if (m_gifArbiter && m_gifArbiter->asyncEnabled())
+            m_gifArbiter->drain();
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
@@ -1018,6 +1035,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
     if (isGsPrivReg(address))
     {
+        if (m_gifArbiter && m_gifArbiter->asyncEnabled())
+            m_gifArbiter->drain();
         // NB: unreachable from write8/16/32/64 today since those all funnel IO
         // register writes through addresses in PS2_IO_BASE's range, which is
         // disjoint from PS2_GS_PRIV_REG_BASE; kept correct for direct callers.
@@ -1735,6 +1754,8 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
 
     if (m_gifArbiter && drainImmediately)
         m_gifArbiter->drain();
+    else if (m_gifArbiter && pathId == GifPathId::Path1 && m_gifArbiter->asyncEnabled())
+        m_gifArbiter->flushAsync();
 }
 
 void PS2Memory::processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount)
@@ -2052,6 +2073,8 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
 {
     if (isGsPrivReg(address))
     {
+        if (m_gifArbiter && m_gifArbiter->asyncEnabled())
+            m_gifArbiter->drain();
         // NB: unreachable from read8/16/32/64 today, same reasoning as the write
         // path above; kept correct for direct callers.
         const uint32_t off = address & 7u;

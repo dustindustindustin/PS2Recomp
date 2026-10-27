@@ -12,6 +12,7 @@ option(PS2X_ENABLE_SCCACHE "Use sccache as compiler launcher when available" ON)
 
 option(PS2X_ENABLE_RUNTIME_LOGS "Enable PS2 runtime logs" OFF)
 option(PS2X_ENABLE_AGRESSIVE_LOGS "Enable very verbose/agressive PS2 runtime logs" OFF)
+option(PS2X_VU1_PENDING_PIPELINE_FAST_PATH "Skip inactive VU1 pipeline scans using pending-entry counts" ON)
 option(PS2X_ENABLE_IOP_RPC_TRACE "Log unhandled IOP/SIF RPC trace suggestions" ON)
 option(PS2X_STRICT_RETURN_DIAGNOSTICS "Route generated JR $ra returns through runtime branch diagnostics" OFF)
 option(PS2X_SHOW_WINDOWS_CONSOLE "Show a console window for ps2EntryRunner on Windows release builds" ON)
@@ -383,6 +384,7 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_gs_gpu.cpp
     src/lib/ps2_gs_memory.cpp
     src/lib/ps2_gs_rasterizer.cpp
+    src/lib/ps2_gs_render_queue.cpp
     src/lib/ps2_iop_host.cpp
     src/lib/ps2_memory.cpp
     src/lib/ps2_pad.cpp
@@ -425,6 +427,7 @@ endif()
 
 target_compile_definitions(ps2_runtime PRIVATE
     PS2X_HAS_FFMPEG=$<BOOL:${PS2X_ENABLE_FFMPEG}>
+    PS2X_VU1_PENDING_PIPELINE_FAST_PATH=$<BOOL:${PS2X_VU1_PENDING_PIPELINE_FAST_PATH}>
 )
 
 file(GLOB_RECURSE KERNEL_SRC_FILES CONFIGURE_DEPENDS

@@ -30,6 +30,7 @@ namespace ps2x::iop::detail
             void reset() override
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
+                m_host.resetAudio(kSid);
                 m_handledCalls = 0u;
                 m_f002Calls = 0u;
                 m_f004Calls = 0u;
@@ -246,8 +247,8 @@ namespace ps2x::iop::detail
                         // KCEJEAST returns:
                         // {auto-DMA volume, packed process statuses,
                         //  auto-DMA status, auto-DMA volume}.
-                        // None of the characterized commands before the first
-                        // 5002 query changes the zero-initialized status.
+                        // The backend replaces this idle fallback with its
+                        // consumed-stream status when AutoDMA is active.
                         const std::array<uint32_t, 4> idleStatus{};
                         if (m_host.writeGuest(request.receive.address,
                                               idleStatus.data(),
@@ -255,6 +256,7 @@ namespace ps2x::iop::detail
                         {
                             ++m_handledCalls;
                             ++m_function5002Calls;
+                            m_host.audioCommand(request.sid, request.function, request.send, request.receive);
                             recordRequest(request, words, wordsReadable);
 
                             RpcResult result;
@@ -322,6 +324,7 @@ namespace ps2x::iop::detail
                         {
                             ++m_handledCalls;
                             ++m_function5003Calls;
+                            m_host.audioCommand(request.sid, request.function, request.send, request.receive);
                             m_last5003FadeStep = static_cast<uint32_t>(fadeStep);
                             recordRequest(request, words, wordsReadable);
 
@@ -381,11 +384,11 @@ namespace ps2x::iop::detail
                         words[0] == m_selfToken &&
                         m_host.zeroGuest(request.receive.address, request.receive.size))
                     {
-                        // KCEJEAST 1020 stages an audio data block. Preserve
-                        // its asynchronous completion contract while audio
-                        // synthesis remains idle.
+                        // IRX 0xe98: full volume, then SpuAutoDMAWrite(address,
+                        // byte count, mode). EE BGM uses a 0x40000-byte ring.
                         ++m_handledCalls;
                         ++m_function1020Calls;
+                        m_host.audioCommand(request.sid, request.function, request.send, request.receive);
                         recordRequest(request, words, wordsReadable);
 
                         RpcResult result;
@@ -401,10 +404,8 @@ namespace ps2x::iop::detail
                     request.mode == kNowaitMode &&
                     validTypedEnvelope &&
                     wordsReadable &&
-                    readableWords >= 4u &&
+                    readableWords >= 1u &&
                     words[0] != 0u &&
-                    words[1] != 0u &&
-                    words[3] != 0u &&
                     (words[0] & (kSelfTokenAlignment - 1u)) == 0u;
                 if (structurallyValid1021)
                 {
@@ -413,10 +414,11 @@ namespace ps2x::iop::detail
                         words[0] == m_selfToken &&
                         m_host.zeroGuest(request.receive.address, request.receive.size))
                     {
-                        // KCEJEAST 1021 finalizes the staged audio block at
-                        // its requested sound-memory destination.
+                        // IRX 0xed4: SD_vSetAutoDMAVolume(0), which stops
+                        // AutoDMA. No arguments; trailing EE words are stale.
                         ++m_handledCalls;
                         ++m_function1021Calls;
+                        m_host.audioCommand(request.sid, request.function, request.send, request.receive);
                         recordRequest(request, words, wordsReadable);
 
                         RpcResult result;
@@ -548,6 +550,7 @@ namespace ps2x::iop::detail
                         {
                             ++m_handledCalls;
                             ++m_function5004Calls;
+                            m_host.audioCommand(request.sid, request.function, request.send, request.receive);
                             m_last5004FadeStep = fadeStep;
                             recordRequest(request, words, wordsReadable);
 
@@ -645,6 +648,7 @@ namespace ps2x::iop::detail
                         // suppresses the handler.
                         ++m_handledCalls;
                         ++m_f006Calls;
+                        m_host.audioCommand(request.sid, request.function, request.send, request.receive);
                         m_lastF006Value = words[1];
                         recordRequest(request, words, wordsReadable);
 

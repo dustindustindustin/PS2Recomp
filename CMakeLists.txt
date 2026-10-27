@@ -93,6 +93,7 @@ if(PS2X_BUILD_ANALYZER)
 endif()
 
 if(PS2X_BUILD_TEST)
+    enable_testing()
     add_subdirectory("ps2xTest")
 endif()
 

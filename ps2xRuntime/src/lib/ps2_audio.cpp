@@ -1,4 +1,11 @@
 #include "runtime/ps2_audio.h"
+#include "runtime/ps2_autodma.h"
+#include <array>
+#include <atomic>
+#include <utility>
+#include <chrono>
+#include <cstdlib>
+#include <iostream>
 #include "runtime/ps2_memory.h"
 #include "ps2_host_backend.h"
 #include <cstring>
@@ -69,6 +76,33 @@ namespace ps2_vag
                 std::vector<int16_t> &outPcm, uint32_t &outSampleRate);
 }
 
+namespace {
+    struct AutoDmaDeviceState {
+        std::mutex mutex;
+        Ps2AutoDmaStream ring;
+        uint64_t renderedFrames = 0u, nonzeroSamples = 0u;
+    };
+    // Raylib callbacks carry no user data. Each typed thunk owns a shared state
+    // slot, never a backend pointer; unload clears it before device teardown.
+    constexpr size_t autoDmaSlotCount = 16u;
+    std::array<std::atomic<std::shared_ptr<AutoDmaDeviceState>>, autoDmaSlotCount> autoDmaSlots;
+    std::array<std::atomic_bool, autoDmaSlotCount> autoDmaSlotReserved{};
+    template<size_t Index> void autoDmaCallback(void *buffer, unsigned frames) {
+        const auto state = autoDmaSlots[Index].load();
+        auto output = std::span<int16_t>(static_cast<int16_t *>(buffer), static_cast<size_t>(frames) * 2u);
+        if (!state) { std::fill(output.begin(), output.end(), 0); return; }
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->ring.renderInto(output);
+        state->ring.retire(frames);
+        state->renderedFrames += frames;
+        state->nonzeroSamples += std::count_if(output.begin(), output.end(), [](int16_t value) { return value != 0; });
+    }
+    template<size_t... Index> auto autoDmaCallbacks(std::index_sequence<Index...>) {
+        return std::array<AudioCallback, sizeof...(Index)>{autoDmaCallback<Index>...};
+    }
+    const auto autoDmaCallbackTable = autoDmaCallbacks(std::make_index_sequence<autoDmaSlotCount>{});
+}
+
 struct PS2AudioBackend::Impl
 {
     struct TrackedSound
@@ -77,16 +111,32 @@ struct PS2AudioBackend::Impl
         uint32_t sampleKey;
     };
     std::vector<TrackedSound> activeSounds;
+    std::shared_ptr<AutoDmaDeviceState> device = std::make_shared<AutoDmaDeviceState>();
+    size_t callbackSlot = autoDmaSlotCount;
+    bool traceAudio = false;
+    uint32_t traceEvents = 0u;
+    AudioStream stream{};
+    bool streamLoaded = false;
+    uint64_t generation = 0u, deviceGeneration = 0u;
+    uint32_t ringAddress = 0u;
+    uint32_t volume = 0u;
+    int64_t fadeStep = 0;
+    bool fadeSuspended = false;
+    std::chrono::steady_clock::time_point fadeClock{};
 };
 
 PS2AudioBackend::PS2AudioBackend() : m_impl(std::make_unique<Impl>())
 {
+    const char *trace = std::getenv("PS2_DUELISTS_AUDIO_TRACE");
+    m_impl->traceAudio = trace && trace[0] != '\0' && trace[0] != '0';
 }
 
 PS2AudioBackend::~PS2AudioBackend()
 {
-    if (m_impl)
+    if (m_impl) {
+        setAudioReady(false);
         stopAll();
+    }
 }
 
 void PS2AudioBackend::onVagTransfer(const uint8_t *rdram, uint32_t srcAddr, uint32_t sizeBytes)
@@ -325,4 +375,136 @@ void PS2AudioBackend::stopAll()
     }
     m_impl->activeSounds.clear();
 #endif
+}
+
+void PS2AudioBackend::setAudioReady(bool ready)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!ready && m_impl->streamLoaded) {
+        autoDmaSlots[m_impl->callbackSlot].store({});
+        StopAudioStream(m_impl->stream);
+        UnloadAudioStream(m_impl->stream);
+        autoDmaSlotReserved[m_impl->callbackSlot].store(false);
+        m_impl->streamLoaded = false;
+        m_impl->callbackSlot = autoDmaSlotCount;
+    }
+    m_audioReady = ready;
+}
+
+void PS2AudioBackend::onDuelistsAutoDma(const uint8_t *rdram, uint32_t function,
+                                       const uint8_t *send, uint32_t sendSize,
+                                       uint8_t *receive, uint32_t receiveSize)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    auto &state = *m_impl;
+    if (function == 0xffffu) {
+        state.device = std::make_shared<AutoDmaDeviceState>();
+        state.volume = 0u;
+        state.fadeStep = 0;
+        state.fadeSuspended = false;
+        ++state.generation;
+        return;
+    }
+    if (!send || sendSize != 0x40u || !receive || receiveSize != 0x10u) return;
+    std::array<uint32_t, 16> words{};
+    std::memcpy(words.data(), send, sizeof(words));
+    if (function == 0x1020u) {
+        const uint32_t address = words[1] & PS2_RAM_MASK;
+        const auto next = std::make_shared<AutoDmaDeviceState>();
+        if (!rdram || words[2] != 0x40000u || address > PS2_RAM_SIZE - words[2] ||
+            !next->ring.start(words[1], {rdram + address, words[2]}, words[3])) return;
+        state.device = next;
+        if (state.traceAudio && state.traceEvents++ < 32u)
+            std::cerr << "[duelists-audio] start ring=0x" << std::hex << words[1]
+                      << " bytes=0x" << words[2] << " mode=" << words[3] << std::dec << '\n';
+        state.ringAddress = address;
+        state.volume = 0x7fffu;
+        ++state.generation;
+    } else if (function == 0x5003u) {
+        const int64_t step = static_cast<int32_t>(words[1]);
+        state.fadeStep = step > 0 ? -step : step;
+    } else if (function == 0x5004u) {
+        const int64_t step = static_cast<int32_t>(words[1]);
+        state.fadeStep = step < 0 ? -step : step;
+    } else if (function == 0xf006u) {
+        state.fadeSuspended = words[1] != 0u;
+    }
+    std::lock_guard<std::mutex> deviceLock(state.device->mutex);
+    if (function == 0x1021u) {
+        state.device->ring.stop();
+        state.volume = 0u;
+        ++state.generation;
+    }
+    // Mirror on the guest thread. Callback code only reads the owned mirror.
+    if (function == 0x5002u && rdram && state.device->ring.active())
+        state.device->ring.mirror({rdram + state.ringAddress, 0x40000u});
+    const std::array<uint32_t, 4> status{state.volume, 0u, state.device->ring.status(), state.volume};
+    std::memcpy(receive, status.data(), sizeof(status));
+}
+
+void PS2AudioBackend::pump()
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    auto &state = *m_impl;
+    if (!m_audioReady) return;
+    bool active;
+    {
+        std::lock_guard<std::mutex> deviceLock(state.device->mutex);
+        active = state.device->ring.active();
+    }
+    if (state.streamLoaded && (state.deviceGeneration != state.generation || !active)) {
+        autoDmaSlots[state.callbackSlot].store({});
+        StopAudioStream(state.stream);
+        UnloadAudioStream(state.stream);
+        autoDmaSlotReserved[state.callbackSlot].store(false);
+        state.streamLoaded = false;
+        state.callbackSlot = autoDmaSlotCount;
+    }
+    if (!active) return;
+    if (!state.streamLoaded) {
+        size_t slot = 0u;
+        for (; slot < autoDmaSlotCount; ++slot) {
+            bool empty = false;
+            if (autoDmaSlotReserved[slot].compare_exchange_strong(empty, true)) {
+                autoDmaSlots[slot].store(state.device);
+                break;
+            }
+        }
+        if (slot == autoDmaSlotCount) return;
+        state.stream = LoadAudioStream(Ps2AutoDmaStream::sampleRate, 16u, 2u);
+        if (!IsAudioStreamValid(state.stream)) {
+            autoDmaSlots[slot].store({});
+            autoDmaSlotReserved[slot].store(false);
+            return;
+        }
+        state.callbackSlot = slot;
+        state.streamLoaded = true;
+        state.deviceGeneration = state.generation;
+        state.fadeClock = std::chrono::steady_clock::now();
+        SetAudioStreamCallback(state.stream, autoDmaCallbackTable[slot]);
+        PlayAudioStream(state.stream);
+    }
+    const auto now = std::chrono::steady_clock::now();
+    constexpr auto vsync = std::chrono::nanoseconds(16683333); // NTSC 59.94 Hz.
+    const int64_t ticks = (now - state.fadeClock) / vsync;
+    state.fadeClock += vsync * ticks;
+    if (ticks > 0 && !state.fadeSuspended && state.fadeStep != 0) {
+        const int64_t next = static_cast<int64_t>(state.volume) + state.fadeStep * ticks;
+        state.volume = static_cast<uint32_t>(std::clamp<int64_t>(next, 0, 0x7fff));
+        if (next <= 0 || next >= 0x7fff) state.fadeStep = 0;
+        if (!state.volume) {
+            std::lock_guard<std::mutex> deviceLock(state.device->mutex);
+            state.device->ring.stop();
+        }
+    }
+    SetAudioStreamVolume(state.stream, static_cast<float>(state.volume) / 32767.0f);
+    if (state.traceAudio && state.traceEvents < 32u) {
+        std::lock_guard<std::mutex> deviceLock(state.device->mutex);
+        if (state.device->renderedFrames != 0u) {
+            ++state.traceEvents;
+            std::cerr << "[duelists-audio] consumed frames=" << state.device->renderedFrames
+                      << " nonzero=" << state.device->nonzeroSamples << " status=0x"
+                      << std::hex << state.device->ring.status() << std::dec << '\n';
+        }
+    }
 }

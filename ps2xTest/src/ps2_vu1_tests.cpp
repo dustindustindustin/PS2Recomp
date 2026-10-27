@@ -5,6 +5,8 @@
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_vu1.h"
 
+#include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -26,7 +28,7 @@ namespace
         {
             if (!mem.initialize())
                 return false;
-            gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
+            mem.bindGS(gs);
             code = mem.getVU1Code();
             data = mem.getVU1Data();
             std::memset(code, 0, PS2_VU1_CODE_SIZE);
@@ -632,6 +634,30 @@ void register_ps2_vu1_tests()
                      "IADDIU should wait for and consume the ILW result");
             t.Equals(vu1.state().cycles, static_cast<uint64_t>(5u),
                      "ILW-to-IALU dependency should account for all stalled cycles");
+        });
+
+        tc.Run("VI15 load stalls a two-source IADD until ready", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+            const uint32_t source[4] = {0x1234u, 0u, 0u, 0u};
+            std::memcpy(fx.data + 2u * 16u, source, sizeof(source));
+            writeVuInstructionPair(fx.code, 0u, makeVuIlw(0x8u, 15u, 1u, 0), kVuUpperNop);
+            writeVuInstructionPair(fx.code, 8u,
+                                   makeVuLowerDirect(0x30u, 15u, 2u, 14u), kVuUpperNop);
+
+            VU1Interpreter vu1;
+            vu1.state().vi[1] = 2;
+            vu1.state().vi[2] = 7;
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE,
+                        fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
+                        0u, 0u, 0u, 5u);
+
+            t.Equals(vu1.state().vi[15], 0x1234, "ILW should commit the highest VI register");
+            t.Equals(vu1.state().vi[14], 0x123B, "IADD should read both source registers");
+            t.Equals(vu1.state().cycles, static_cast<uint64_t>(5u),
+                     "VI15 dependency should stall IADD through the fourth cycle");
         });
 
         tc.Run("DIV and SQRT update the Q register from selected vector components", [](TestCase &t)
@@ -1378,7 +1404,7 @@ void register_ps2_vu1_tests()
             t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
 
             GS gs;
-            gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
+            mem.bindGS(gs);
             GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
             {
                 gs.processGIFPacket(data, sizeBytes);
@@ -1434,14 +1460,15 @@ void register_ps2_vu1_tests()
             const uint32_t mscalCmd = makeVifCmd(0x14u, 0u, 0u);
             mem.processVIF1Data(reinterpret_cast<const uint8_t *>(&mscalCmd), sizeof(mscalCmd));
 
-            const uint8_t *vramOut = mem.getGSVRAM();
             bool imageOk = true;
             for (uint32_t x = 0; x < 4u && imageOk; ++x)
             {
                 const uint32_t off = GSPSMCT32::addrPSMCT32(0u, 1u, x, 0u);
                 for (uint32_t c = 0; c < 4u; ++c)
                 {
-                    if (vramOut[off + c] != static_cast<uint8_t>(0x90u + x * 4u + c))
+                    uint8_t actualByte = 0u;
+                    gs.copyVramBytes(off + c, &actualByte, sizeof(actualByte));
+                    if (actualByte != static_cast<uint8_t>(0x90u + x * 4u + c))
                     {
                         imageOk = false;
                         break;
@@ -1523,6 +1550,33 @@ void register_ps2_vu1_tests()
                      "FSSET should replace sticky bits while preserving current and D/I bits");
         });
 
+        tc.Run("VU1 reset clears pending pipeline activity counts", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+            writeVuInstructionPair(fx.code, 0u,
+                                   makeVuFlagImmediate(0x15u, 0u, 0xA80u),
+                                   makeVuUpper(0x28u, 0xFu, 2u, 1u, 3u));
+            writeVuInstructionPair(fx.code, 8u, 0u,
+                                   kVuUpperNop | 0x40000000u);
+            writeVuInstructionPair(fx.code, 16u, 0u, kVuUpperNop);
+
+            VU1Interpreter vu1;
+            vu1.state().vf[1][0] = 1.0f;
+            vu1.state().vf[2][0] = 2.0f;
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE,
+                        fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
+                        0u, 0u, 0u, 1u);
+
+            vu1.reset();
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE,
+                        fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
+                        8u, 0u, 0u, 10u);
+            t.Equals(vu1.state().cycles, static_cast<uint64_t>(2u),
+                     "reset should discard pending flag and vector write counts before E flush");
+        });
+
         tc.Run("VU1 has one flag pipeline and FSSET wins a same-pair conflict", [](TestCase &t)
         {
             Vu1Fixture fx;
@@ -1599,6 +1653,39 @@ void register_ps2_vu1_tests()
                       "FMAND on the commit cycle should observe the new MAC flags");
         });
 
+        tc.Run("VU1 resume reads VF and flags committed at a cycle boundary", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+            writeVuInstructionPair(fx.code, 0u, 0u,
+                                   makeVuUpper(0x28u, 0x8u, 2u, 1u, 3u));
+            for (uint32_t pc = 8u; pc <= 24u; pc += 8u)
+                writeVuInstructionPair(fx.code, pc, 0u, kVuUpperNop);
+            writeVuInstructionPair(fx.code, 32u,
+                                   makeVuSq(0x8u, 3u, 0u, 0), kVuUpperNop);
+
+            VU1Interpreter vu1;
+            vu1.state().vf[1][0] = -1.0f;
+            vu1.state().vf[2][0] = -2.0f;
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE,
+                        fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
+                        0u, 0u, 0u, 4u);
+            t.Equals(vu1.state().vf[3][0], -3.0f,
+                     "VF write should commit at the fourth cycle boundary");
+            t.Equals(vu1.state().mac, 0x80u,
+                     "MAC sign should commit at the same boundary");
+            t.Equals(vu1.state().status, 0x82u,
+                     "STATUS sign should commit at the same boundary");
+
+            vu1.resume(fx.code, PS2_VU1_CODE_SIZE,
+                       fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
+                       0u, 0u, 1u);
+            float stored = 0.0f;
+            std::memcpy(&stored, fx.data, sizeof(stored));
+            t.Equals(stored, -3.0f,
+                     "the first resumed pair should read the committed VF value");
+        });
+
         tc.Run("VU1 CLIP and FCGET share the four-cycle flag timeline", [](TestCase &t)
         {
             Vu1Fixture fx;
@@ -1663,6 +1750,177 @@ void register_ps2_vu1_tests()
                      "overflow should clamp to the largest finite VU value");
             t.Equals(vu1.state().vf[3][1], 0.0f,
                      "underflow should flush to signed zero before writeback");
+        });
+
+        tc.Run("VU1 FMAC ordinary and exponent-boundary results keep exact flags", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+            writeVuInstructionPair(fx.code, 0u, 0u,
+                                   makeVuUpper(0x2Au, 0xFu, 2u, 1u, 3u));
+
+            VU1Interpreter vu1;
+            vu1.state().vf[1][0] = 2.0f;
+            vu1.state().vf[1][1] = -3.0f;
+            vu1.state().vf[1][2] = std::numeric_limits<float>::min();
+            vu1.state().vf[1][3] = std::numeric_limits<float>::max();
+            vu1.state().vf[2][0] = 3.0f;
+            vu1.state().vf[2][1] = 2.0f;
+            vu1.state().vf[2][2] = 1.0f;
+            vu1.state().vf[2][3] = 1.0f;
+
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE,
+                        fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
+                        0u, 0u, 0u, 5u);
+
+            t.Equals(vu1.state().vf[3][0], 6.0f, "ordinary positive result");
+            t.Equals(vu1.state().vf[3][1], -6.0f, "ordinary negative result");
+            t.Equals(vu1.state().vf[3][2], std::numeric_limits<float>::min(),
+                     "minimum normal result");
+            t.Equals(vu1.state().vf[3][3], std::numeric_limits<float>::max(),
+                     "maximum finite result");
+            t.Equals(vu1.state().mac, 0x40u, "only y should set the sign flag");
+            t.Equals(vu1.state().status, 0x82u,
+                     "current and sticky status should contain only sign");
+        });
+
+        tc.Run("VU1 operand normalization matches the bit reference across boundaries and random inputs", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+            writeVuInstructionPair(fx.code, 0u, 0u,
+                                   makeVuUpper(0x2Au, 0xFu, 2u, 1u, 3u));
+
+            VU1Interpreter vu1;
+            for (uint32_t lane = 0; lane < 4u; ++lane)
+                vu1.state().vf[2][lane] = 1.0f;
+
+            constexpr std::array<uint32_t, 24> boundary = {
+                0x00000000u, 0x80000000u, 0x00000001u, 0x80000001u,
+                0x007FFFFFu, 0x807FFFFFu, 0x00800000u, 0x80800000u,
+                0x00800001u, 0x80800001u, 0x3F800000u, 0xBF800000u,
+                0x7F7FFFFEu, 0xFF7FFFFEu, 0x7F7FFFFFu, 0xFF7FFFFFu,
+                0x7F800000u, 0xFF800000u, 0x7F800001u, 0xFF800001u,
+                0x7FC00000u, 0xFFC00000u, 0x7FFFFFFFu, 0xFFFFFFFFu
+            };
+            uint32_t randomState = 0x8647A3C5u;
+            bool allMatch = true;
+            for (uint32_t group = 0; group < 1030u; ++group)
+            {
+                uint32_t expected[4];
+                for (uint32_t lane = 0; lane < 4u; ++lane)
+                {
+                    const uint32_t index = group * 4u + lane;
+                    randomState ^= randomState << 13;
+                    randomState ^= randomState >> 17;
+                    randomState ^= randomState << 5;
+                    const uint32_t bits = index < boundary.size() ? boundary[index] : randomState;
+                    vu1.state().vf[1][lane] = std::bit_cast<float>(bits);
+
+                    const uint32_t exponent = (bits >> 23) & 0xFFu;
+                    expected[lane] = exponent == 0u
+                                         ? bits & 0x80000000u
+                                         : exponent == 0xFFu
+                                               ? (bits & 0x80000000u) | 0x7F7FFFFFu
+                                               : bits;
+                }
+                vu1.execute(fx.code, PS2_VU1_CODE_SIZE,
+                            fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
+                            0u, 0u, 0u, 5u);
+                for (uint32_t lane = 0; lane < 4u; ++lane)
+                    allMatch &= std::bit_cast<uint32_t>(vu1.state().vf[3][lane]) == expected[lane];
+            }
+            t.IsTrue(allMatch, "MUL by one should preserve every normalized source bit pattern");
+        });
+
+        tc.Run("VU1 upper operand families read only their normalized sources", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+            VU1Interpreter vu1;
+            const auto run = [&](uint32_t upper, uint32_t vsBits, uint32_t vtBits,
+                                 uint32_t accBits, uint32_t qBits, uint32_t iBits,
+                                 uint32_t expectedBits, bool accDestination,
+                                 const char *description)
+            {
+                writeVuInstructionPair(fx.code, 0u, 0u, upper);
+                fx.mem.markVU1CodeModified();
+                vu1.reset();
+                vu1.state().vf[1][0] = std::bit_cast<float>(vsBits);
+                vu1.state().vf[2][0] = std::bit_cast<float>(vtBits);
+                vu1.state().acc[0] = std::bit_cast<float>(accBits);
+                vu1.state().q = std::bit_cast<float>(qBits);
+                vu1.state().i = std::bit_cast<float>(iBits);
+                vu1.execute(fx.code, PS2_VU1_CODE_SIZE,
+                            fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
+                            0u, 0u, 0u, 5u);
+                const float actual = accDestination ? vu1.state().acc[0] : vu1.state().vf[3][0];
+                t.Equals(std::bit_cast<uint32_t>(actual), expectedBits, description);
+            };
+
+            constexpr uint32_t one = 0x3F800000u;
+            constexpr uint32_t two = 0x40000000u;
+            constexpr uint32_t three = 0x40400000u;
+            constexpr uint32_t six = 0x40C00000u;
+            constexpr uint32_t tiny = 0x00000001u;
+            constexpr uint32_t posInf = 0x7F800000u;
+            constexpr uint32_t negInf = 0xFF800000u;
+            constexpr uint32_t maxFinite = 0x7F7FFFFFu;
+            constexpr uint32_t minFinite = 0xFF7FFFFFu;
+            run(makeVuUpper(0x00u, 0x8u, 2u, 1u, 3u), two, tiny, posInf, posInf, posInf,
+                two, false, "ADDbc flushes a subnormal VT source");
+            run(makeVuUpper(0x29u, 0x8u, 2u, 1u, 3u), two, three, tiny, posInf, posInf,
+                six, false, "MADD flushes a subnormal ACC source");
+            run(makeVuUpper(0x1Cu, 0x8u, 2u, 1u, 3u), one, tiny, tiny, posInf, tiny,
+                maxFinite, false, "MULq clamps an infinite Q source");
+            run(makeVuUpper(0x22u, 0x8u, 2u, 1u, 3u), 0u, tiny, tiny, tiny, posInf,
+                maxFinite, false, "ADDi clamps an infinite I source");
+            run(makeVuUpper(0x2Bu, 0x8u, 2u, 1u, 3u), one, posInf, tiny, tiny, tiny,
+                maxFinite, false, "MAX clamps an infinite vector source");
+            run(makeVuUpper(0x2Fu, 0x8u, 2u, 1u, 3u), one, negInf, tiny, tiny, tiny,
+                minFinite, false, "MINI clamps a negative infinite vector source");
+            run(makeVuUpperSpecial(0x18u, 0x8u, 2u, 1u), two, three, tiny, tiny, tiny,
+                six, true, "MULAbc reads the broadcast lane into ACC");
+            run(makeVuUpperSpecial(0x08u, 0x8u, 2u, 1u), two, three, tiny, tiny, tiny,
+                six, true, "MADDAbc flushes a subnormal ACC source");
+            run(makeVuUpper(0x2Eu, 0x8u, 2u, 1u, 3u), two, three, tiny, tiny, tiny,
+                0u, false, "OPMSUB preserves its component-swizzled zero lane");
+
+            writeVuInstructionPair(fx.code, 0u, 0u,
+                                   makeVuUpperSpecial(0x14u, 0x8u, 2u, 1u));
+            fx.mem.markVU1CodeModified();
+            vu1.reset();
+            vu1.state().vf[1][0] = std::bit_cast<float>(tiny);
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE,
+                        fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
+                        0u, 0u, 0u, 5u);
+            t.Equals(std::bit_cast<uint32_t>(vu1.state().vf[2][0]), 0u,
+                     "FTOI0 flushes its subnormal source before conversion");
+
+            writeVuInstructionPair(fx.code, 0u, 0u,
+                                   makeVuUpperSpecial(0x2Eu, 0x8u, 2u, 1u));
+            fx.mem.markVU1CodeModified();
+            vu1.reset();
+            vu1.state().vf[1][1] = 2.0f;
+            vu1.state().vf[2][2] = 3.0f;
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE,
+                        fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
+                        0u, 0u, 0u, 5u);
+            t.Equals(vu1.state().acc[0], 6.0f,
+                     "OPMULA reads the cross-product Y and Z source lanes");
+
+            writeVuInstructionPair(fx.code, 0u, 0u,
+                                   makeVuUpper(0x2Eu, 0x8u, 2u, 1u, 3u));
+            fx.mem.markVU1CodeModified();
+            vu1.reset();
+            vu1.state().vf[1][1] = 2.0f;
+            vu1.state().vf[2][2] = 3.0f;
+            vu1.state().acc[0] = 10.0f;
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE,
+                        fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
+                        0u, 0u, 0u, 5u);
+            t.Equals(vu1.state().vf[3][0], 4.0f,
+                     "OPMSUB reads the cross-product Y and Z source lanes");
         });
 
         tc.Run("FMAC product contributes Z/S/U/O sticky flags", [](TestCase &t)

@@ -1,4 +1,5 @@
 #include "MiniTest.h"
+#include "runtime/ps2_autodma.h"
 #include "ps2x/iop/iop_subsystem.h"
 
 #include <algorithm>
@@ -1843,6 +1844,82 @@ void register_ps2_iop_tests()
                 t.Equals(metricValue(*service, "active_f002_arena_size"), uint64_t{0},
                          "reset should clear the active arena size");
             }
+        });
+
+        tc.Run("AutoDMA renders planar stereo and reports only consumed ring halves", [](TestCase &t)
+        {
+            Ps2AutoDmaStream stream;
+            std::vector<uint8_t> ring(0x40000u, 0u);
+            const int16_t left = 1234, right = -2345;
+            std::memcpy(ring.data(), &left, 2u);
+            std::memcpy(ring.data() + 0x200u, &right, 2u);
+            t.IsTrue(stream.start(0xc1800u, ring, 1u), "looping DMA ring should start");
+            auto pcm = stream.render(0x8000u);
+            t.Equals(pcm[0], left, "left planar sample must reach output");
+            t.Equals(pcm[1], right, "right planar sample must reach output");
+            t.Equals(stream.status(), 0xc1800u, "queued samples must not advance consumed status");
+            stream.retire(0x8000u);
+            t.Equals(stream.status(), 0x010e1800u, "consumed half must change half flag and source address");
+            stream.stop();
+            t.Equals(stream.status(), 0u, "stop must clear DMA status");
+            t.IsTrue(stream.start(0xc1800u, ring, 1u), "restart should succeed");
+            t.Equals(stream.status(), 0xc1800u, "restart must reset the consumed cursor");
+            t.IsFalse(stream.start(0xc1800u, ring, 3u), "uncharted DMA modes must be rejected");
+            t.IsFalse(stream.start(0xc1800u, std::span<const uint8_t>(ring.data(), 3u), 1u), "partial stereo blocks must be rejected");
+        });
+
+        tc.Run("AutoDMA half refill replaces future stereo output without moving consumed status", [](TestCase &t)
+        {
+            Ps2AutoDmaStream stream;
+            std::vector<uint8_t> ring(0x40000u, 0u);
+            t.IsTrue(stream.start(0xc1800u, ring, 1u), "ring should start");
+            stream.render(0x8000u);
+            stream.retire(0x8000u);
+            const int16_t left = 3000, right = -4000;
+            std::memcpy(ring.data() + 0x20000u, &left, 2u);
+            std::memcpy(ring.data() + 0x20200u, &right, 2u);
+            stream.mirror(ring);
+            const auto pcm = stream.render(256u);
+            t.Equals(pcm[0], left, "refill left sample should reach output");
+            t.Equals(pcm[1], right, "refill right sample should reach output");
+            t.Equals(stream.status(), 0x010e1800u, "mirroring and queueing must not retire samples");
+            stream.retire(256u);
+            t.Equals(stream.status(), 0x010e1c00u, "retired block must advance the DMA address");
+        });
+
+        tc.Run("Duelists 1021 ignores stale arguments and forwards its no-argument stop", [](TestCase &t)
+        {
+            FakeIopHost host;
+            IopSubsystem subsystem(host);
+            std::string error;
+            t.IsTrue(subsystem.configure({"SLUS_205.15", 0u, 0u}, &error), "Duelists profile should configure");
+            RpcRequest request{};
+            request.sid = 0x05730601u;
+            request.send = {0x1180u, 0x40u};
+            request.receive = {0x1280u, 0x10u};
+            host.writeWord(0x1180u, 0x00400080u);
+            host.writeWord(0x1184u, 0u);
+            host.writeWord(0x1188u, 0x5000u);
+            request.function = 0x5f10u;
+            t.IsTrue(subsystem.handleRpc(request).handled, "registration should establish token");
+            host.writeWord(0x1188u, 0u);
+            host.audioCalls = 0u;
+            request.function = 0x1021u;
+            request.mode = 1u;
+            auto result = subsystem.handleRpc(request);
+            t.IsTrue(result.handled, "zero stale words must not reject stop");
+            t.IsTrue(result.signalNowaitCompletion, "stop must retain NOWAIT completion");
+            t.Equals(host.audioCalls, 1u, "accepted stop must reach backend");
+            request.mode = 0u;
+            t.IsFalse(subsystem.handleRpc(request).handled, "wrong-mode stop must reject");
+            t.Equals(host.audioCalls, 1u, "rejected stop must not reach backend");
+            request.mode = 1u;
+            host.writeWord(0x1180u, 0x004000c0u);
+            t.IsFalse(subsystem.handleRpc(request).handled, "mismatched token stop must reject");
+            host.writeWord(0x1180u, 0x00400080u);
+            request.send.size = 0x3cu;
+            t.IsFalse(subsystem.handleRpc(request).handled, "malformed envelope stop must reject");
+            t.Equals(host.audioCalls, 1u, "invalid stops must never reach backend");
         });
 
         tc.Run("Duelists 5202 stops all programs through its NOWAIT typed envelope", [](TestCase &t)
