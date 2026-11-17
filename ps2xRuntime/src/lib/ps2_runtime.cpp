@@ -2543,6 +2543,10 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
         {
             GuestExecutionScope guestExecution(this);
             fn(rdram, ctx, this);
+            if (m_performanceMetricsEnabled)
+            {
+                m_performanceGuestDispatches.fetch_add(1u, std::memory_order_relaxed);
+            }
             handoffBaseline = guestExecutionHandoffEpochSnapshot();
         }
 
@@ -3148,6 +3152,10 @@ void PS2Runtime::run()
 
     g_activeThreads.store(1, std::memory_order_relaxed);
     std::atomic<bool> gameThreadFinished{false};
+    const char *performanceMetricsPath = std::getenv("PS2X_PERF_METRICS_PATH");
+    m_performanceMetricsEnabled =
+        performanceMetricsPath != nullptr && *performanceMetricsPath != '\0';
+    m_performanceGuestDispatches.store(0u, std::memory_order_relaxed);
 
     std::thread gameThread([&]()
                            {
@@ -3174,6 +3182,19 @@ void PS2Runtime::run()
 
     uint64_t tick = 0;
     uint64_t hostFrame = 0;
+    const auto performanceStart = std::chrono::steady_clock::now();
+    auto nextPerformanceSample = performanceStart + std::chrono::seconds(1);
+    std::ofstream performanceMetrics;
+    if (m_performanceMetricsEnabled)
+    {
+        performanceMetrics.open(performanceMetricsPath, std::ios::out | std::ios::trunc);
+        if (performanceMetrics)
+        {
+            performanceMetrics << "elapsed_seconds\thost_frames\tpresented_frames"
+                                  "\tguest_dispatches\tgs_draws\tgs_transfers"
+                                  "\tvu0_runs\tvu0_pairs\tvu1_runs\tvu1_pairs\n";
+        }
+    }
     const bool automatedStart = std::getenv("PS2X_AUTOMATED_PAD_START") != nullptr;
     const bool automatedNewGame = std::getenv("PS2X_AUTOMATED_NEW_GAME") != nullptr;
     const bool automatedContinue = std::getenv("PS2X_AUTOMATED_CONTINUE") != nullptr;
@@ -3343,6 +3364,30 @@ void PS2Runtime::run()
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
         UploadFrame(frameTex, this, presentWidth, presentHeight);
+
+        const auto performanceNow = std::chrono::steady_clock::now();
+        if (performanceMetrics && performanceNow >= nextPerformanceSample)
+        {
+            const GSDebugSnapshot gsPerformance = m_gs.getDebugSnapshot();
+            const double elapsedSeconds =
+                std::chrono::duration<double>(performanceNow - performanceStart).count();
+            performanceMetrics << std::fixed << std::setprecision(3) << elapsedSeconds
+                               << '\t' << hostFrame
+                               << '\t' << m_gs.hostPresentationGeneration()
+                               << '\t' << m_performanceGuestDispatches.load(std::memory_order_relaxed)
+                               << '\t' << gsPerformance.drawCount
+                               << '\t' << gsPerformance.transferCount
+                               << '\t' << m_vu0.runCount()
+                               << '\t' << m_vu0.instructionPairCount()
+                               << '\t' << m_vu1.runCount()
+                               << '\t' << m_vu1.instructionPairCount()
+                               << '\n';
+            performanceMetrics.flush();
+            do
+            {
+                nextPerformanceSample += std::chrono::seconds(1);
+            } while (nextPerformanceSample <= performanceNow);
+        }
 
 #if !defined(PLATFORM_VITA)
         // F8 saves the bounded diagnostic history without enabling continuous
