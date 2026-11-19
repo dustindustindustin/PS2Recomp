@@ -421,6 +421,47 @@ void register_ps2_runtime_io_tests()
             t.IsTrue(std::filesystem::exists(hostPath), "sceMcOpen/sceMcWrite should create the host file under mcRoot");
         });
 
+        tc.Run("sceMcOpen with only O_CREAT creates a file without truncating existing data", [](TestCase &t)
+        {
+            TestContext test;
+            clearContext(test.ctx);
+            ps2_stubs::sceMcFormat(test.rdram.data(), &test.ctx, nullptr);
+            t.Equals(syncMc(test.rdram), 0, "sceMcFormat should finish successfully");
+
+            const auto saveDir = test.paths.mcRoot / "SAVEDATA";
+            const auto hostPath = saveDir / "test.bin";
+            std::filesystem::create_directories(saveDir);
+            const uint32_t fileAddr = GUEST_STRING_AREA_START + 0x500;
+            writeGuestString(test.rdram.data(), fileAddr, "/SAVEDATA/test.bin");
+
+            auto openCreateAndClose = [&]() {
+                clearContext(test.ctx);
+                setRegU32(test.ctx, 6, fileAddr);
+                setRegU32(test.ctx, 7, PS2_FIO_O_CREAT);
+                ps2_stubs::sceMcOpen(test.rdram.data(), &test.ctx, nullptr);
+                const int32_t fd = syncMc(test.rdram);
+                t.IsTrue(fd > 0, "sceMcOpen(O_CREAT) should return a descriptor");
+                if (fd > 0)
+                {
+                    clearContext(test.ctx);
+                    setRegU32(test.ctx, 4, static_cast<uint32_t>(fd));
+                    ps2_stubs::sceMcClose(test.rdram.data(), &test.ctx, nullptr);
+                    t.Equals(syncMc(test.rdram), 0, "sceMcClose should finish successfully");
+                }
+            };
+
+            openCreateAndClose();
+            t.IsTrue(std::filesystem::exists(hostPath), "sceMcOpen(O_CREAT) should create the missing file");
+
+            const std::string payload = "existing save";
+            std::ofstream(hostPath, std::ios::binary) << payload;
+            openCreateAndClose();
+            std::ifstream input(hostPath, std::ios::binary);
+            std::string preserved;
+            std::getline(input, preserved);
+            t.Equals(preserved, payload, "sceMcOpen(O_CREAT) should preserve an existing file");
+        });
+
         tc.Run("sceMcGetDir includes dot entries and file metadata", [](TestCase &t)
         {
             TestContext test;

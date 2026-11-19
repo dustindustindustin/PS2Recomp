@@ -441,6 +441,7 @@ namespace ps2_stubs
 
             std::error_code ec;
             const bool exists = std::filesystem::exists(hostPath, ec) && !ec;
+            const std::string path = hostPath.string();
 
             const char *mode = "rb";
             if (read && write)
@@ -473,8 +474,17 @@ namespace ps2_stubs
                     mode = "r+b";
                 }
             }
+            else if (create && !exists)
+            {
+                // Create the file without granting write access on the returned handle.
+                FILE *created = std::fopen(path.c_str(), "ab");
+                if (!created || std::fclose(created) != 0)
+                {
+                    return nullptr;
+                }
+            }
 
-            return std::fopen(hostPath.string().c_str(), mode);
+            return std::fopen(path.c_str(), mode);
         }
     }
 
